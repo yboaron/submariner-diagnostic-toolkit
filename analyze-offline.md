@@ -6,6 +6,36 @@ description: Analyze Submariner diagnostics offline from collected data
 
 You are analyzing Submariner diagnostic data that was collected offline. The user does NOT have live cluster access.
 
+## Critical Analysis Principles (IMPORTANT - READ FIRST)
+
+### 1. Use Cautious Language
+- Use: "appears to be", "seems like", "most likely", "could be"
+- Avoid: Definitive statements like "This is" or "The root cause is"
+- Acknowledge uncertainty and need for further investigation
+- Consider that proposed solutions might also fail
+
+### 2. Treat Infrastructure as Black Box
+- DON'T dive into iptables/nftables/kernel/low-level details
+- Reference official Submariner prerequisites documentation
+- Keep recommendations high-level
+- Trust Submariner components unless logs show errors
+
+### 3. Clearly Distinguish Workarounds from Fixes
+- Label each workaround explicitly as "Workaround"
+- Explain what it does and WHY it's not a root cause fix
+- Warn about trade-offs (especially security impacts)
+- Provide verification steps after applying workaround
+
+### 4. Auto-Detect Deployment Type
+- Always check `acm-addons.txt` and `submarinerconfig.yaml`
+- Provide deployment-specific instructions (ACM-Managed vs Standalone)
+- Never give generic instructions that could apply to both
+
+### 5. Focus on Direct Remediation
+- Provide kubectl commands to fix issues directly
+- Only use `subctl show/diagnose/verify` for VERIFICATION after fixes
+- NEVER recommend `subctl deploy-broker` or `subctl join`
+
 ## Your Role
 
 Analyze the diagnostic data (tarball or directory) and provide root cause analysis based on the user's complaint. Use the same troubleshooting logic as the live commands, but read from files instead of running kubectl/subctl commands.
@@ -80,6 +110,23 @@ diagnostics-dir/
 - Extract timestamp
 - Extract complaint (if not provided by user)
 - Note which clusters were collected
+
+**Detect Deployment Type (CRITICAL):**
+
+Read both files from cluster1:
+- `cluster1/acm-addons.txt`
+- `cluster1/submarinerconfig.yaml`
+
+**If EITHER file contains actual resources (not "No ... resources found"):**
+  → **Deployment Type: ACM-Managed**
+  → All configuration changes must be made to SubmarinerConfig CR on ACM hub cluster
+  → DO NOT modify Submariner CR directly (ACM addon will override it)
+  → In workaround instructions, provide ACM-specific commands
+
+**If BOTH files say "No ... resources found":**
+  → **Deployment Type: Standalone Submariner**
+  → Configuration changes made to Submariner CR in each managed cluster
+  → In workaround instructions, provide Standalone-specific commands
 
 ### Phase 3: Determine Analysis Focus Based on Complaint
 
@@ -487,6 +534,7 @@ DIAGNOSTIC DATA:
   Timestamp: <from manifest>
   Complaint: <user complaint>
   Clusters Analyzed: cluster1, cluster2
+  Deployment Type: <Standalone Submariner / ACM-Managed>
 
 ========================================
 EXECUTIVE SUMMARY
@@ -632,33 +680,136 @@ is encapsulated inside the IPsec tunnel, so infrastructure only sees ESP/UDP pac
 
 <Briefly mention 1-2 other possible causes if the evidence is not 100% conclusive>
 
+**Next Steps for Investigation:**
+
+1. **Verify Submariner Prerequisites:**
+   Ensure all infrastructure and datapath prerequisites are properly configured:
+
+   📖 [Submariner Prerequisites Documentation](https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_management_for_kubernetes/2.15/html/networking/networking#submariner-prereqs)
+
+2. **Confirm Network Path Requirements:**
+   - Verify required protocols are allowed between gateway nodes
+   - Review security policies or filtering rules that might affect traffic
+
+**Possible Root Causes:**
+<List 2-3 possible causes based on evidence - e.g., ESP protocol blocking, UDP port blocking, etc.>
+
+**What we know is NOT the issue:**
+<List ruled-out causes with reasoning - e.g., "Pre-shared key mismatch (IKE negotiation succeeded)">
+
 ========================================
 RECOMMENDED SOLUTION
 ========================================
 
-**Note:** These recommendations are based on offline analysis of diagnostic data. If the suggested solution doesn't resolve the issue, proceed to the "Further Investigation Steps" section below.
+**Important:** Clearly distinguish between workarounds and root cause fixes.
 
-**STEP 1: <First Action - Most Likely Fix>**
-<Simple, clear instructions>
-<Mention what this addresses>
+**Deployment Type Detected: <Standalone Submariner / ACM-Managed>**
 
-**STEP 2: <Second Action>**
-<Simple, clear instructions>
+---
 
-**STEP 3: Verify the Fix**
-<How to verify if the solution worked>
+**Workaround 1: <Name> (Recommended First Try)**
 
-**STEP 4: Collect Fresh Diagnostics**
-After making changes, collect new diagnostics to verify the fix and re-analyze if needed.
+**What it does:** <Clear explanation>
 
-**Documentation Reference:**
+**Why it's a workaround:** <Explain it doesn't fix root cause>
 
-📖 **Official Submariner Documentation:**
-   URL: <relevant documentation URL>
-   Section: "<section name>"
-   Search for: "<search string>"
+**Security Impact:** <✓ Maintains encryption / ❌ Removes encryption>
 
-Summary of what they'll find in the documentation.
+**How to apply:**
+
+**For Standalone Submariner:**
+```bash
+kubectl patch submariner -n submariner-operator submariner \
+  --type merge \
+  -p '{"spec": {"<field>": <value>}}'
+
+kubectl delete pods -n submariner-operator -l app=submariner-<component>
+```
+
+**For ACM-Managed Submariner:**
+```bash
+# On the ACM hub cluster
+kubectl patch submarinerconfig -n <managed-cluster-namespace> <submarinerconfig-name> \
+  --type merge \
+  -p '{"spec": {"<field>": <value>}}'
+
+# ACM will propagate changes automatically to managed clusters
+```
+
+**Verify the fix:**
+```bash
+# Wait ~30 seconds for changes to propagate, then check:
+subctl show connections
+# Expected: <expected output>
+
+subctl diagnose all
+# Expected: All checks should pass
+```
+
+**Expected outcome:** <What should happen after applying this workaround>
+
+---
+
+**Workaround 2: Switch to VXLAN Cable Driver**
+
+**What it does:** Uses VXLAN (UDP-based tunneling) instead of IPsec.
+
+**Why it's a workaround:** Avoids IPsec/ESP entirely - doesn't fix infrastructure blocking.
+
+**⚠️ CRITICAL SECURITY IMPACT:**
+**VXLAN does NOT encrypt traffic between clusters.** All pod-to-pod communication will be sent in **CLEAR TEXT**.
+
+Only use this if:
+- Your clusters are on a trusted private network
+- You have other encryption (service mesh with mTLS)
+- You accept the security risk for testing/lab environments
+
+**How to apply:**
+
+**For Standalone Submariner:**
+```bash
+kubectl patch submariner -n submariner-operator submariner \
+  --type merge \
+  -p '{"spec": {"cableDriver": "vxlan"}}'
+
+kubectl delete pods -n submariner-operator -l app=submariner-routeagent
+# Gateway pods will restart automatically
+```
+
+**For ACM-Managed Submariner:**
+```bash
+# On the ACM hub cluster
+kubectl patch submarinerconfig -n <managed-cluster-namespace> <submarinerconfig-name> \
+  --type merge \
+  -p '{"spec": {"cableDriver": "vxlan"}}'
+
+# ACM will propagate changes automatically
+```
+
+**Verify the fix:**
+```bash
+# Wait ~30 seconds, then check:
+subctl show connections
+# Expected: CABLE DRIVER: vxlan, STATUS: connected
+
+subctl verify --only connectivity --verbose
+```
+
+**Trade-offs:**
+- ❌ **No encryption** - all inter-cluster traffic in clear text
+- ❌ **Will NOT work if UDP encapsulation failed** - Both use same UDP port (4500)
+- ✓ Simpler protocol, might bypass ESP-specific packet inspection
+
+**Critical Note:**
+
+**If UDP encapsulation (Workaround 1) fails**, VXLAN will **definitely also fail** because both use the exact same UDP port (4500).
+
+**Only consider VXLAN if:**
+- UDP encapsulation **works** but you want to avoid IPsec for other reasons
+- You accept **unencrypted traffic**
+- You understand the security implications
+
+**Bottom line:** VXLAN is **not a workaround for UDP port blocking** - it's only an alternative if you want to avoid IPsec while keeping the same network requirements.
 
 ========================================
 FURTHER INVESTIGATION STEPS
