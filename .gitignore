@@ -1,0 +1,23 @@
+# Diagnostic data (don't commit collected diagnostics)
+submariner-diagnostics-*.tar.gz
+submariner-diagnostics-*/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
