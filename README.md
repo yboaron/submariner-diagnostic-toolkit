@@ -1,6 +1,6 @@
 # Submariner Diagnostic Toolkit
 
-Comprehensive toolkit for collecting and analyzing Submariner diagnostics data.
+Comprehensive toolkit for collecting and analyzing Submariner diagnostics **offline** - no live cluster access required for analysis.
 
 ## Features
 
@@ -52,13 +52,13 @@ For deeper analysis with Claude AI:
 ```bash
 # Copy the analysis skill to Claude Code
 mkdir -p ~/.config/claude-code/skills
-cp analyze-offline.md ~/.config/claude-code/skills/
+cp submariner-analyze-offline.md ~/.config/claude-code/skills/
 ```
 
 **Usage:**
 Open Claude Code and run:
 ```
-/analyze-offline submariner-diagnostics-TIMESTAMP.tar.gz
+/submariner:analyze-offline submariner-diagnostics-TIMESTAMP.tar.gz
 ```
 
 **Prerequisites:**
@@ -157,7 +157,7 @@ Recommendations:
 
 **Step 3: (Optional) Advanced Analysis**
 ```
-/analyze-offline submariner-diagnostics-*.tar.gz
+/submariner:analyze-offline submariner-diagnostics-*.tar.gz
 ```
 *Provides:*
 - Detailed tcpdump pattern analysis
@@ -268,7 +268,7 @@ pip install pyyaml
 ```
 
 **Advanced analysis: Skill not found**
-- Verify `analyze-offline.md` copied to `~/.config/claude-code/skills/`
+- Verify `submariner-analyze-offline.md` copied to `~/.config/claude-code/skills/`
 - Restart Claude Code
 - Try: `ls ~/.config/claude-code/skills/`
 
