@@ -1,5 +1,6 @@
 ---
 description: Analyze Submariner diagnostics offline from collected data
+args: <diagnostics-path> [complaint]
 ---
 
 # Submariner Offline Analysis
@@ -142,6 +143,7 @@ Based on the complaint, route to appropriate analysis:
 
 3. **"connectivity issues"** / **"cannot reach pods"** / **"ping fails"**
    → Focus: Datapath analysis (both tunnel and local routing)
+   → **PRIORITY CHECK:** Compare verify tests - if regular packets fail but small packets pass, this is MTU issue!
 
 4. **"suspect firewall or other infrastructure issue"** / **"firewall"**
    → Focus: IPsec datapath analysis, check tcpdump data if available
@@ -151,6 +153,7 @@ Based on the complaint, route to appropriate analysis:
 
 6. **"general health check"** / **"not sure"** / **Generic / No specific complaint**
    → Perform comprehensive health check
+   → **ALWAYS check MTU pattern** if verify tests exist (compare regular vs small packet results)
 
 ### Phase 4: Read Diagnostic Files
 
@@ -200,6 +203,11 @@ Note: The verify files contain the actual command executed at the top. Check if:
 - The same context was used for both --context and --tocontext (common mistake)
 - Correct packet sizes were specified
 - Proper kubeconfig was used
+- **Early stop detection:** Tests may have stopped early to save time
+  - Look for: "Verification stopped early after N consecutive test failures"
+  - This indicates systemic connectivity issues (first 6 tests failed)
+  - Failed test details are captured before the stop
+  - Treat early-stopped tests as failed - they indicate connectivity problems
 
 #### G. For RouteAgent Issues:
 1. `cluster1/routeagents.yaml` - RouteAgent status
@@ -293,14 +301,26 @@ Check for routes to remote cluster CIDRs:
 
 **Step 6: Verify Health Check IPs**
 
+**IMPORTANT:** You can verify health check IP existence from collected data - no live cluster access needed!
+
 File: `cluster*/gather/cluster*/<gateway-node>_ip-a.log`
+
+Search for the health check IP (from Gateway CR) in the ip-a.log file:
+```bash
+# Example: If healthCheckIP is 10.130.1.1, search for it:
+grep "10.130.1.1" cluster1/gather/cluster1/cluster1-worker_ip-a.log
+```
 
 Look for health check IP on veth interfaces:
 ```
 inet 10.130.1.1/32 scope global veth...
 ```
 
-**Expected:** Health check IP should exist on the gateway node
+**Expected:** Health check IP should exist on the gateway node on one or more veth interfaces
+
+**Analysis:**
+- **If health check IP exists:** The issue is most likely NOT health check IP configuration - focus on datapath/infrastructure blocking
+- **If health check IP is missing:** This could indicate a configuration issue that needs further investigation
 
 **Step 7: Check Gateway and RouteAgent Logs**
 
@@ -369,19 +389,36 @@ Cluster2 analysis: "Total packets captured: 0"
 ```
 
 **Pattern 2: Egress but No Ingress (Infrastructure Blocking)**
+
+**CRITICAL:** tcpdump captures BOTH incoming and outgoing packets. If you only see "Out" packets with NO "In" packets, it means packets are NOT arriving.
+
+**Note:** The tcpdump capture filter is set based on the cable driver and configuration:
+- libreswan with ESP: `proto 50`
+- libreswan with UDP encapsulation: `udp port 4500` (or ceIPSecNATTPort)
+- vxlan: `udp port 4500` (or ceIPSecNATTPort)
+
+The analysis checks for packet direction (In/Out) regardless of the underlying protocol.
+
 ```
-Cluster1 analysis: "Total packets captured: 150" (packets going to cluster2)
-Cluster2 analysis: "Total packets captured: 0" (no incoming from cluster1)
+Example A - Unidirectional blocking:
+Cluster1 analysis: "Total packets captured: 150" (all "Out" direction)
+Cluster2 analysis: "Total packets captured: 0"
 
-OR
+→ Packets leaving cluster1 but NOT arriving at cluster2
+→ Infrastructure blocking cluster1→cluster2 direction
 
-Cluster1 analysis: "Total packets captured: 0" (no incoming from cluster2)
-Cluster2 analysis: "Total packets captured: 150" (packets going to cluster1)
+Example B - Bidirectional blocking:
+Cluster1 analysis: "Total packets captured: 150" (all "Out", no "In")
+Cluster2 analysis: "Total packets captured: 94" (all "Out", no "In")
 
-→ Packets leaving source gateway but NOT arriving at destination
-→ Root cause: INFRASTRUCTURE BLOCKING (firewall/network blocking ESP or UDP)
+→ Both clusters sending packets, but NEITHER receiving
+→ Infrastructure blocking tunnel traffic in BOTH directions
+→ This is the most common infrastructure blocking pattern
+
+Root cause: INFRASTRUCTURE BLOCKING (firewall/network blocking tunnel traffic)
+→ Check what protocol is being used (ESP proto 50 or UDP port)
 → If ESP (proto 50): Recommend UDP encapsulation
-→ If UDP already: Check firewall rules for UDP port
+→ If UDP already: Verify firewall allows the UDP port
 ```
 
 **Pattern 3: Both Sending but Tunnel Still Error**
@@ -406,34 +443,64 @@ If tunnels are ESTABLISHED (ipsec-status shows STATE_V2_ESTABLISHED_CHILD_SA):
       → Root cause is INFRASTRUCTURE LEVEL (firewall/network blocking)
 
       Read tcpdump analysis files:
-        If cluster1 analysis shows packets BUT cluster2 analysis shows 0:
+        If cluster1 analysis shows packets (Out direction) BUT cluster2 analysis shows 0:
           → Packets leaving cluster1 but not reaching cluster2
-          → ESP protocol (proto 50) or UDP being blocked between nodes
-          → SOLUTION: Try UDP encapsulation (if using ESP)
+          → Tunnel traffic being blocked between nodes
+          → Check cable driver and protocol being used:
+            - libreswan with ESP: Try UDP encapsulation
+            - libreswan with UDP or vxlan: Verify firewall allows UDP port
 
         If both analysis files show 0 packets:
           → Gateway not sending packets
-          → Check gateway pod logs for IPsec initialization errors
+          → Check gateway pod logs for cable driver initialization errors
 ```
 
 #### **Analysis 2: MTU Issues**
 
-**Compare verify results:**
+**CRITICAL:** Always compare both verify test results to detect MTU issues
 
 Read:
 - `verify/connectivity.txt` - Default packet size (~3000 bytes)
 - `verify/connectivity-small-packet.txt` - Small packet size (400 bytes)
 
-**MTU Issue Pattern:**
-- Default packet test FAILS
+**MTU Issue Pattern (DEFINITIVE):**
+- Default packet test FAILS (may have stopped early after 6 failures)
 - Small packet test SUCCEEDS
 
-→ **ROOT CAUSE: MTU/fragmentation issue**
+→ **ROOT CAUSE: MTU/fragmentation issue** (high confidence)
 
-**Recommendation:** Apply TCP MSS clamping
+**This is THE classic MTU pattern - do NOT ignore it!**
 
-**Note:** Health check pings use default small ICMP packet size, so if health checks are
-failing, MTU is NOT the root cause.
+**Why this indicates MTU:**
+- Large packets (~3KB) cannot traverse the network path due to MTU restrictions
+- Small packets (400 bytes) fit within MTU limits and succeed
+- If tunnels are connected but large packets fail, the issue is NOT at tunnel level
+- The infrastructure allows the tunnel protocol (ESP/UDP) but fragments/drops large packets
+
+**Solution: TCP MSS Clamping**
+
+In network topologies where MTU issues are observed, the encapsulation overhead added by Submariner can cause packet drops. This happens when nodes along the path don't adjust the path MTU value correctly to account for the encapsulation overhead.
+
+To resolve this, you can force a specific MSS clamping value by adding an annotation to the Gateway nodes, which instructs Submariner to rewrite the TCP Maximum Segment Size.
+
+Apply TCP MSS clamping by annotating gateway nodes:
+
+```bash
+# Annotate gateway nodes with MSS value
+kubectl annotate node <gateway-node-name> submariner.io/tcp-clamp-mss=<value>
+
+# Restart routeagent pods to pick up the change
+kubectl delete pod -n submariner-operator -l app=submariner-routeagent
+```
+
+Recommended MSS value: **1300** (accounts for encapsulation overhead in standard networks)
+
+Adjust based on your network MTU if needed.
+
+**Important Notes:**
+- Health check pings use small ICMP packets, so if health checks fail, MTU is NOT the root cause
+- MTU issues only appear with large data transfers, not control plane
+- Tunnels may show "connected" status even with MTU issues (health checks still work)
 
 #### **Analysis 3: RouteAgent Health**
 
@@ -489,6 +556,25 @@ verify/service-discovery.txt
 
 ### Phase 6: Provide Analysis Report
 
+**OUTPUT FORMAT: Provide Brief Analysis (DEFAULT)**
+
+**IMPORTANT:** Always provide a **brief, actionable report** as the default output format. Only provide the detailed report if the user explicitly requests it.
+
+**Brief report should include:**
+1. **Key Findings** (3-5 bullet points) - What's working, what's broken
+2. **Root Cause** (1-2 paragraphs) - Most likely issue based on evidence
+3. **Recommended Next Steps** (3 steps with correct priority order):
+   - **Step 1: Verify Prerequisites FIRST**
+   - **Step 2: Apply workaround if needed**
+   - **Step 3: Alternative workaround if Step 2 fails**
+4. **Reference to detailed files analyzed** - For transparency
+
+**DO NOT provide:**
+- Massive detailed reports with 10+ sections
+- Extensive workaround options (pick top 2 most likely solutions)
+- Speculative deep-dives into all possible causes
+- Workarounds before verifying prerequisites
+
 **IMPORTANT: Use Cautious Language and Acknowledge Uncertainty**
 
 When analyzing offline diagnostic data, you are working with a snapshot in time without live cluster access. Therefore:
@@ -522,6 +608,113 @@ When providing solutions:
 - Submariner routeagent manages iptables/nftables rules
 - If routeagent logs show NO errors, don't recommend manual iptables investigation
 - Treat routing/iptables as a black box unless routeagent logs indicate problems
+
+---
+
+**BRIEF REPORT FORMAT (USE THIS)**
+
+Provide a brief report following this template:
+
+```
+## SUBMARINER OFFLINE ANALYSIS - BRIEF REPORT
+
+**Diagnostic:** <diagnostics-path>
+**Issue:** <complaint from manifest>
+**Deployment:** <Standalone Submariner / ACM-Managed>
+
+### Key Findings
+
+✓/✗ **Finding 1** - Brief description with file reference
+✓/✗ **Finding 2** - Brief description with file reference
+✓/✗ **Finding 3** - Brief description with file reference
+✓/✗ **Finding 4** - Brief description with file reference
+
+### Root Cause
+
+<1-2 paragraph explanation using cautious language like "appears to be", "most likely", "seems to indicate">
+
+Key evidence:
+- Evidence point 1 (file:line reference)
+- Evidence point 2 (file:line reference)
+- Evidence point 3 (file:line reference)
+
+### Recommended Next Steps
+
+**IMPORTANT: For MTU Issues ONLY - Do NOT include the "Verify Prerequisites" section**
+
+When MTU issue is detected (small packets pass, large packets fail), provide ONLY the TCP MSS clamping solution:
+
+**Apply TCP MSS Clamping**
+
+**What it does:** Adjusts the TCP Maximum Segment Size to account for Submariner's encapsulation overhead.
+
+**Why this is needed:** Submariner encapsulation adds overhead to packets, and most probably some nodes along the path don't adjust the path MTU value correctly, so we need to force MSS clamping value.
+
+**Security Impact:** ✓ Maintains encryption - only adjusts TCP packet sizes
+
+**Steps:**
+
+1. **Annotate gateway nodes:**
+
+```bash
+kubectl --context cluster1 annotate node <gateway-node> \
+  submariner.io/tcp-clamp-mss=<value>
+
+kubectl --context cluster2 annotate node <gateway-node> \
+  submariner.io/tcp-clamp-mss=<value>
+```
+
+Recommended starting value: **1300** (accounts for encapsulation overhead in standard networks)
+
+2. **Restart routeagent pods to apply changes:**
+
+```bash
+kubectl --context cluster1 delete pod -n submariner-operator -l app=submariner-routeagent
+kubectl --context cluster2 delete pod -n submariner-operator -l app=submariner-routeagent
+```
+
+3. **Verify the fix:**
+
+Re-run the default packet size test that initially failed:
+
+```bash
+subctl verify --context cluster1 --tocontext cluster2 --only connectivity --verbose
+```
+
+Expected outcome: Default packet size tests (~3KB) that previously failed should now pass with MSS clamping enabled.
+
+---
+
+**For Other Issues (Tunnel Not Connected, Firewall Blocking, etc.):**
+
+**1. Verify Submariner Prerequisites (FIRST PRIORITY)**
+
+Check if required protocols are allowed between gateway nodes:
+- **ESP (IP protocol 50)** OR **UDP port 4500**
+- Provide specific verification commands for the environment (KIND/cloud/etc.)
+
+📖 [Submariner Prerequisites](https://submariner.io/operations/deployment/prerequisites/)
+
+**2. <Workaround Name> (If Prerequisites Cannot Be Met)**
+
+<Brief explanation of workaround - what it does and why it's a workaround>
+
+**Security Impact:** <✓ Maintains encryption / ❌ Removes encryption>
+
+```bash
+<Concrete commands to apply workaround>
+```
+
+### Files Analyzed
+- List key files examined for transparency
+
+**Priority:** <HIGH/MEDIUM/LOW> - <reason>
+**Confidence:** <HIGH/MEDIUM/LOW> - <reason>
+```
+
+---
+
+**DETAILED REPORT FORMAT (OPTIONAL - Only if user requests detailed analysis)**
 
 Create a comprehensive report following this format:
 
@@ -701,19 +894,88 @@ is encapsulated inside the IPsec tunnel, so infrastructure only sees ESP/UDP pac
 RECOMMENDED SOLUTION
 ========================================
 
-**Important:** Clearly distinguish between workarounds and root cause fixes.
+**IMPORTANT INSTRUCTIONS:**
+
+**For MTU Issues:** Skip Step 1 (Verify Prerequisites) entirely. Provide ONLY the TCP MSS clamping solution as shown below. MTU issues are not related to protocol blocking or prerequisites.
+
+**For Other Issues (Tunnel Not Connected, ESP Blocking, etc.):** Follow Steps 1-3 in order - verify prerequisites first, then apply workarounds if needed.
 
 **Deployment Type Detected: <Standalone Submariner / ACM-Managed>**
 
 ---
 
-**Workaround 1: <Name> (Recommended First Try)**
+**For MTU Issues ONLY - TCP MSS Clamping:**
 
-**What it does:** <Clear explanation>
+**What it does:** Adjusts the TCP Maximum Segment Size to account for Submariner's encapsulation overhead.
 
-**Why it's a workaround:** <Explain it doesn't fix root cause>
+**Why this is needed:** Submariner encapsulation adds overhead to packets, and most probably some nodes along the path don't adjust the path MTU value correctly, so we need to force MSS clamping value.
 
-**Security Impact:** <✓ Maintains encryption / ❌ Removes encryption>
+**Security Impact:** ✓ Maintains encryption - only adjusts TCP packet sizes
+
+**How to apply:**
+
+1. **Annotate gateway nodes:**
+
+```bash
+kubectl --context cluster1 annotate node <gateway-node> \
+  submariner.io/tcp-clamp-mss=1300
+
+kubectl --context cluster2 annotate node <gateway-node> \
+  submariner.io/tcp-clamp-mss=1300
+```
+
+2. **Restart routeagent pods to pick up the change:**
+
+```bash
+kubectl --context cluster1 delete pod -n submariner-operator -l app=submariner-routeagent
+kubectl --context cluster2 delete pod -n submariner-operator -l app=submariner-routeagent
+```
+
+3. **Verify the fix:**
+
+Re-run the default packet size test that initially failed:
+
+```bash
+subctl verify --context cluster1 --tocontext cluster2 --only connectivity --verbose
+```
+
+Expected outcome: Default packet size tests (~3KB) that previously failed should now pass with MSS clamping enabled.
+
+---
+
+**For Other Issues (NOT MTU) - Step 1: Verify Submariner Prerequisites (FIRST PRIORITY)**
+
+Before applying any workarounds, verify that the infrastructure meets Submariner's network requirements.
+
+**Required for Submariner:**
+- **ESP (IP protocol 50)** between gateway nodes, OR
+- **UDP port 4500** between gateway nodes (for UDP encapsulation mode)
+
+**How to verify:**
+
+<Provide specific commands to check if ESP or UDP port 4500 is allowed between the gateway nodes>
+<For KIND environments: Check Docker networking and host iptables>
+<For cloud environments: Check security groups, network policies, firewall rules>
+
+📖 [Submariner Prerequisites Documentation](https://submariner.io/operations/deployment/prerequisites/)
+
+**If ESP (protocol 50) is blocked but UDP port 4500 is allowed:**
+→ Proceed to Step 2 (UDP Encapsulation workaround)
+
+**If both ESP and UDP port 4500 are blocked:**
+→ Fix the infrastructure/firewall rules first before proceeding
+
+---
+
+**Step 2: Enable UDP Encapsulation (WORKAROUND if ESP is blocked)**
+
+**What it does:** Forces IPsec payload to be encapsulated inside UDP packets (port 4500), **regardless of whether NAT was detected**. Even when Submariner NAT discovery selects private IP addresses (meaning no NAT is present), setting `ceIPSecForceUDPEncaps: true` will still use UDP encapsulation instead of native ESP.
+
+**Why it's a workaround:** Doesn't fix the infrastructure blocking of ESP protocol - works around it by forcing UDP transport. This helps when:
+- ESP (IP protocol 50) is blocked by firewall/network infrastructure
+- BUT UDP port 4500 is allowed
+
+**Security Impact:** ✓ Maintains encryption - IPsec payload is still encrypted, just transported over UDP instead of ESP
 
 **How to apply:**
 
@@ -721,9 +983,9 @@ RECOMMENDED SOLUTION
 ```bash
 kubectl patch submariner -n submariner-operator submariner \
   --type merge \
-  -p '{"spec": {"<field>": <value>}}'
+  -p '{"spec": {"ceIPSecForceUDPEncaps": true}}'
 
-kubectl delete pods -n submariner-operator -l app=submariner-<component>
+kubectl delete pods -n submariner-operator -l app=submariner-gateway
 ```
 
 **For ACM-Managed Submariner:**
@@ -731,7 +993,7 @@ kubectl delete pods -n submariner-operator -l app=submariner-<component>
 # On the ACM hub cluster
 kubectl patch submarinerconfig -n <managed-cluster-namespace> <submarinerconfig-name> \
   --type merge \
-  -p '{"spec": {"<field>": <value>}}'
+  -p '{"spec": {"ceIPSecForceUDPEncaps": true}}'
 
 # ACM will propagate changes automatically to managed clusters
 ```
@@ -740,17 +1002,17 @@ kubectl patch submarinerconfig -n <managed-cluster-namespace> <submarinerconfig-
 ```bash
 # Wait ~30 seconds for changes to propagate, then check:
 subctl show connections
-# Expected: <expected output>
+# Expected: STATUS should change from "error" to "connected"
 
 subctl diagnose all
-# Expected: All checks should pass
+# Expected: Gateway connection checks should pass
 ```
 
-**Expected outcome:** <What should happen after applying this workaround>
+**Expected outcome:** Tunnel should establish using UDP port 4500 instead of ESP protocol 50
 
 ---
 
-**Workaround 2: Switch to VXLAN Cable Driver**
+**Step 3: Switch to VXLAN Cable Driver (LAST RESORT)**
 
 **What it does:** Uses VXLAN (UDP-based tunneling) instead of IPsec.
 
@@ -1043,8 +1305,8 @@ Example of what offline analysis will see in tcpdump files:
 ```
 TCPDUMP CAPTURE SUMMARY: cluster1 Gateway
 Node: cluster1-worker
-Capture Filter: proto 50
-Capture Duration: 30 seconds
+Capture Filter: proto 50  # or "udp port 4500" depending on cable driver/config
+Capture Duration: 80 seconds
 
 CAPTURE STATISTICS:
   Total packets captured: 150
@@ -1057,8 +1319,8 @@ UNIQUE SOURCE -> DESTINATION PAIRS:
 ```
 TCPDUMP CAPTURE SUMMARY: cluster2 Gateway
 Node: cluster2-worker
-Capture Filter: proto 50
-Capture Duration: 30 seconds
+Capture Filter: proto 50  # or "udp port 4500" depending on cable driver/config
+Capture Duration: 80 seconds
 
 CAPTURE STATISTICS:
   Total packets captured: 0
@@ -1067,10 +1329,10 @@ Capture filter: proto 50
 File size: 24 bytes (empty or too small)
 ```
 
-Analysis: Compare packet counts:
-- Cluster1: 150 packets (sending to 172.18.0.5)
+Analysis: Compare packet counts and direction:
+- Cluster1: 150 packets (all "Out" direction - sending to 172.18.0.5)
 - Cluster2: 0 packets (not receiving from 172.18.0.4)
 
-Conclusion: Pattern 2 (Egress but No Ingress) → Infrastructure blocking ESP protocol
+Conclusion: Pattern 2 (Egress but No Ingress) → Infrastructure blocking tunnel traffic (ESP proto 50 or UDP depending on cable driver)
 
 You are the offline diagnostic expert that analyzes collected data and finds the root cause!

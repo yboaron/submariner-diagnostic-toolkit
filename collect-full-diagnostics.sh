@@ -81,14 +81,19 @@ collect_tcpdump_from_cluster() {
     echo "  Gateway node: ${GATEWAY_NODE}"
 
     # Get Submariner configuration to determine capture filter
+    CABLE_DRIVER=$(kubectl get submariner submariner -n submariner-operator --kubeconfig="${kubeconfig}" -o jsonpath='{.spec.cableDriver}' 2>/dev/null)
+    CABLE_DRIVER=${CABLE_DRIVER:-libreswan}  # Default to libreswan if not set
     USING_IP=$(kubectl get submariner submariner -n submariner-operator --kubeconfig="${kubeconfig}" -o jsonpath='{.status.gateways[0].connections[0].usingIP}' 2>/dev/null)
     PRIVATE_IP=$(kubectl get submariner submariner -n submariner-operator --kubeconfig="${kubeconfig}" -o jsonpath='{.status.gateways[0].connections[0].endpoint.private_ip}' 2>/dev/null)
     FORCE_UDP=$(kubectl get submariner submariner -n submariner-operator --kubeconfig="${kubeconfig}" -o jsonpath='{.spec.ceIPSecForceUDPEncaps}' 2>/dev/null)
     NATT_PORT=$(kubectl get submariner submariner -n submariner-operator --kubeconfig="${kubeconfig}" -o jsonpath='{.spec.ceIPSecNATTPort}' 2>/dev/null)
     NATT_PORT=${NATT_PORT:-4500}  # Default to 4500 if not set
 
-    # Determine capture filter
-    if [ "$FORCE_UDP" = "true" ] || [ "$USING_IP" != "$PRIVATE_IP" ]; then
+    # Determine capture filter based on cable driver and configuration
+    if [ "$CABLE_DRIVER" = "vxlan" ]; then
+        CAPTURE_FILTER="udp port ${NATT_PORT}"
+        echo "  Capture filter: ${CAPTURE_FILTER} (VXLAN cable driver)"
+    elif [ "$FORCE_UDP" = "true" ] || [ "$USING_IP" != "$PRIVATE_IP" ]; then
         CAPTURE_FILTER="udp port ${NATT_PORT}"
         echo "  Capture filter: ${CAPTURE_FILTER} (UDP encapsulation detected)"
     else
@@ -532,26 +537,167 @@ if [ "$SKIP_VERIFY" = "false" ]; then
     echo ""
     echo "Running subctl verify for connectivity (using --only ${VERIFY_CONNECTIVITY_FLAG})..."
     echo "  Start time: $(date '+%Y-%m-%d %H:%M:%S')"
-    VERIFY_CMD="KUBECONFIG=${MERGED_KUBECONFIG} subctl verify --context ${CLUSTER1_NAME} --tocontext ${CLUSTER2_NAME} --only ${VERIFY_CONNECTIVITY_FLAG} --verbose ${IMAGE_OVERRIDE}"
+    echo ""
+    echo "  Note: Verification tests may take 20-30 minutes if connectivity issues exist"
+    echo "        Tests will stop early if first 6 tests fail (indicating systemic issues)"
+    echo "        Showing progress every 60 seconds..."
+    echo ""
+
+    VERIFY_CMD="KUBECONFIG=${MERGED_KUBECONFIG} subctl verify --context ${CLUSTER1_NAME} --tocontext ${CLUSTER2_NAME} --only ${VERIFY_CONNECTIVITY_FLAG} --connection-timeout 50 --verbose ${IMAGE_OVERRIDE}"
     echo "========================================" > "${OUTPUT_DIR}/verify/connectivity.txt"
     echo "Command executed:" >> "${OUTPUT_DIR}/verify/connectivity.txt"
     echo "${VERIFY_CMD}" >> "${OUTPUT_DIR}/verify/connectivity.txt"
     echo "========================================" >> "${OUTPUT_DIR}/verify/connectivity.txt"
     echo "" >> "${OUTPUT_DIR}/verify/connectivity.txt"
-    KUBECONFIG="${MERGED_KUBECONFIG}" subctl verify --context "${CLUSTER1_NAME}" --tocontext "${CLUSTER2_NAME}" --only "${VERIFY_CONNECTIVITY_FLAG}" --verbose ${IMAGE_OVERRIDE} >> "${OUTPUT_DIR}/verify/connectivity.txt" 2>&1 || echo "Connectivity verification failed or timed out" >> "${OUTPUT_DIR}/verify/connectivity.txt"
+
+    # Run verify in background with progress monitoring
+    VERIFY_TIMEOUT=1800  # 30 minutes max
+    PROGRESS_INTERVAL=60  # Show progress every 60 seconds
+    EARLY_STOP_THRESHOLD=6  # Stop early if first 6 tests all fail
+
+    (
+        KUBECONFIG="${MERGED_KUBECONFIG}" subctl verify \
+            --context "${CLUSTER1_NAME}" \
+            --tocontext "${CLUSTER2_NAME}" \
+            --only "${VERIFY_CONNECTIVITY_FLAG}" \
+            --connection-timeout 50 \
+            --verbose ${IMAGE_OVERRIDE} \
+            >> "${OUTPUT_DIR}/verify/connectivity.txt" 2>&1
+    ) &
+    VERIFY_PID=$!
+
+    # Monitor progress and check for early-stop condition
+    elapsed=0
+    while kill -0 $VERIFY_PID 2>/dev/null; do
+        # Check timeout
+        if [ $elapsed -ge $VERIFY_TIMEOUT ]; then
+            echo "  ⚠ Verify tests exceeded ${VERIFY_TIMEOUT}s timeout - terminating"
+            kill $VERIFY_PID 2>/dev/null
+            echo "" >> "${OUTPUT_DIR}/verify/connectivity.txt"
+            echo "Verification terminated after ${VERIFY_TIMEOUT}s timeout" >> "${OUTPUT_DIR}/verify/connectivity.txt"
+            break
+        fi
+
+        # Check if we should stop early due to consistent failures
+        # Count completed tests (each test ends with "• [X.XXX seconds]")
+        if [ -f "${OUTPUT_DIR}/verify/connectivity.txt" ]; then
+            completed_tests=$(grep -c "\[.*seconds\]" "${OUTPUT_DIR}/verify/connectivity.txt" 2>/dev/null)
+            # Ensure it's a valid number
+            if ! [[ "$completed_tests" =~ ^[0-9]+$ ]]; then
+                completed_tests=0
+            fi
+        else
+            completed_tests=0
+        fi
+
+        if [ "$completed_tests" -ge "$EARLY_STOP_THRESHOLD" 2>/dev/null ]; then
+            # Check if tests have completed normally (final summary exists)
+            if ! grep -q "^Ran.*Specs" "${OUTPUT_DIR}/verify/connectivity.txt" 2>/dev/null; then
+                # Tests still running - check if tests are failing
+                # Ginkgo shows failures with FAIL or timeout messages
+                failure_blocks=$(grep -c "FAIL\|timed out\|refused" "${OUTPUT_DIR}/verify/connectivity.txt" 2>/dev/null || echo "0")
+
+                if [ "$failure_blocks" -ge "$EARLY_STOP_THRESHOLD" ]; then
+                    echo "  ⚠ First $completed_tests tests failing - stopping early to save time"
+                    echo "     (Collected enough diagnostic data to identify connectivity issues)"
+                    kill $VERIFY_PID 2>/dev/null
+                    echo "" >> "${OUTPUT_DIR}/verify/connectivity.txt"
+                    echo "Verification stopped early after $completed_tests consecutive test failures" >> "${OUTPUT_DIR}/verify/connectivity.txt"
+                    echo "This indicates systemic connectivity issues - see failed test details above" >> "${OUTPUT_DIR}/verify/connectivity.txt"
+                    break
+                fi
+            fi
+        fi
+
+        sleep $PROGRESS_INTERVAL
+        elapsed=$((elapsed + PROGRESS_INTERVAL))
+        if [ "$completed_tests" -gt 0 ]; then
+            echo "  ... still running (${elapsed}s elapsed, $completed_tests tests completed)"
+        else
+            echo "  ... still running (${elapsed}s elapsed)"
+        fi
+    done
+
+    wait $VERIFY_PID 2>/dev/null || echo "Connectivity verification failed or timed out" >> "${OUTPUT_DIR}/verify/connectivity.txt"
     echo "  End time: $(date '+%Y-%m-%d %H:%M:%S')"
 
     if [ "$RUN_MTU_TEST" = "true" ]; then
         echo ""
         echo "Running subctl verify for connectivity (small packet size for MTU testing)..."
         echo "  Start time: $(date '+%Y-%m-%d %H:%M:%S')"
-        VERIFY_CMD="KUBECONFIG=${MERGED_KUBECONFIG} subctl verify --context ${CLUSTER1_NAME} --tocontext ${CLUSTER2_NAME} --only connectivity --verbose --packet-size 400 ${IMAGE_OVERRIDE}"
+        echo "  Note: Showing progress every 60 seconds..."
+        echo ""
+
+        VERIFY_CMD="KUBECONFIG=${MERGED_KUBECONFIG} subctl verify --context ${CLUSTER1_NAME} --tocontext ${CLUSTER2_NAME} --only connectivity --connection-timeout 50 --verbose --packet-size 400 ${IMAGE_OVERRIDE}"
         echo "========================================" > "${OUTPUT_DIR}/verify/connectivity-small-packet.txt"
         echo "Command executed:" >> "${OUTPUT_DIR}/verify/connectivity-small-packet.txt"
         echo "${VERIFY_CMD}" >> "${OUTPUT_DIR}/verify/connectivity-small-packet.txt"
         echo "========================================" >> "${OUTPUT_DIR}/verify/connectivity-small-packet.txt"
         echo "" >> "${OUTPUT_DIR}/verify/connectivity-small-packet.txt"
-        KUBECONFIG="${MERGED_KUBECONFIG}" subctl verify --context "${CLUSTER1_NAME}" --tocontext "${CLUSTER2_NAME}" --only connectivity --verbose --packet-size 400 ${IMAGE_OVERRIDE} >> "${OUTPUT_DIR}/verify/connectivity-small-packet.txt" 2>&1 || echo "Connectivity verification with small packets failed or timed out" >> "${OUTPUT_DIR}/verify/connectivity-small-packet.txt"
+
+        # Run verify in background with progress monitoring
+        (
+            KUBECONFIG="${MERGED_KUBECONFIG}" subctl verify \
+                --context "${CLUSTER1_NAME}" \
+                --tocontext "${CLUSTER2_NAME}" \
+                --only connectivity \
+                --connection-timeout 50 \
+                --verbose \
+                --packet-size 400 \
+                ${IMAGE_OVERRIDE} \
+                >> "${OUTPUT_DIR}/verify/connectivity-small-packet.txt" 2>&1
+        ) &
+        VERIFY_PID=$!
+
+        # Monitor progress and check for early-stop condition
+        elapsed=0
+        while kill -0 $VERIFY_PID 2>/dev/null; do
+            # Check timeout
+            if [ $elapsed -ge $VERIFY_TIMEOUT ]; then
+                echo "  ⚠ MTU test exceeded ${VERIFY_TIMEOUT}s timeout - terminating"
+                kill $VERIFY_PID 2>/dev/null
+                echo "" >> "${OUTPUT_DIR}/verify/connectivity-small-packet.txt"
+                echo "Verification terminated after ${VERIFY_TIMEOUT}s timeout" >> "${OUTPUT_DIR}/verify/connectivity-small-packet.txt"
+                break
+            fi
+
+            # Check if we should stop early due to consistent failures
+            if [ -f "${OUTPUT_DIR}/verify/connectivity-small-packet.txt" ]; then
+                completed_tests=$(grep -c "\[.*seconds\]" "${OUTPUT_DIR}/verify/connectivity-small-packet.txt" 2>/dev/null)
+                # Ensure it's a valid number
+                if ! [[ "$completed_tests" =~ ^[0-9]+$ ]]; then
+                    completed_tests=0
+                fi
+            else
+                completed_tests=0
+            fi
+
+            if [ "$completed_tests" -ge "$EARLY_STOP_THRESHOLD" 2>/dev/null ]; then
+                if ! grep -q "^Ran.*Specs" "${OUTPUT_DIR}/verify/connectivity-small-packet.txt" 2>/dev/null; then
+                    failure_blocks=$(grep -c "FAIL\|timed out\|refused" "${OUTPUT_DIR}/verify/connectivity-small-packet.txt" 2>/dev/null || echo "0")
+
+                    if [ "$failure_blocks" -ge "$EARLY_STOP_THRESHOLD" ]; then
+                        echo "  ⚠ First $completed_tests MTU tests failing - stopping early to save time"
+                        echo "     (Collected enough diagnostic data to identify MTU/packet size issues)"
+                        kill $VERIFY_PID 2>/dev/null
+                        echo "" >> "${OUTPUT_DIR}/verify/connectivity-small-packet.txt"
+                        echo "Verification stopped early after $completed_tests consecutive test failures" >> "${OUTPUT_DIR}/verify/connectivity-small-packet.txt"
+                        echo "This indicates systemic connectivity issues - see failed test details above" >> "${OUTPUT_DIR}/verify/connectivity-small-packet.txt"
+                        break
+                    fi
+                fi
+            fi
+
+            sleep $PROGRESS_INTERVAL
+            elapsed=$((elapsed + PROGRESS_INTERVAL))
+            if [ "$completed_tests" -gt 0 ]; then
+                echo "  ... still running (${elapsed}s elapsed, $completed_tests tests completed)"
+            else
+                echo "  ... still running (${elapsed}s elapsed)"
+            fi
+        done
+
+        wait $VERIFY_PID 2>/dev/null || echo "Connectivity verification with small packets failed or timed out" >> "${OUTPUT_DIR}/verify/connectivity-small-packet.txt"
         echo "  End time: $(date '+%Y-%m-%d %H:%M:%S')"
     else
         echo "Skipping MTU test (tunnel connected on only one cluster)"
@@ -575,15 +721,81 @@ if [ "$SKIP_VERIFY" = "false" ]; then
     SD_ENABLED_CLUSTER2=$(kubectl get submariner submariner -n submariner-operator --kubeconfig "${KUBECONFIG2}" -o jsonpath='{.spec.serviceDiscoveryEnabled}' 2>/dev/null)
 
     if [ "$SD_ENABLED_CLUSTER1" = "true" ] || [ "$SD_ENABLED_CLUSTER2" = "true" ]; then
+        echo ""
         echo "Running subctl verify for service-discovery..."
         echo "  Start time: $(date '+%Y-%m-%d %H:%M:%S')"
-        VERIFY_CMD="KUBECONFIG=${MERGED_KUBECONFIG} subctl verify --context ${CLUSTER1_NAME} --tocontext ${CLUSTER2_NAME} --only service-discovery --verbose ${IMAGE_OVERRIDE}"
+        echo "  Note: Showing progress every 60 seconds..."
+        echo ""
+
+        VERIFY_CMD="KUBECONFIG=${MERGED_KUBECONFIG} subctl verify --context ${CLUSTER1_NAME} --tocontext ${CLUSTER2_NAME} --only service-discovery --connection-timeout 50 --verbose ${IMAGE_OVERRIDE}"
         echo "========================================" > "${OUTPUT_DIR}/verify/service-discovery.txt"
         echo "Command executed:" >> "${OUTPUT_DIR}/verify/service-discovery.txt"
         echo "${VERIFY_CMD}" >> "${OUTPUT_DIR}/verify/service-discovery.txt"
         echo "========================================" >> "${OUTPUT_DIR}/verify/service-discovery.txt"
         echo "" >> "${OUTPUT_DIR}/verify/service-discovery.txt"
-        KUBECONFIG="${MERGED_KUBECONFIG}" subctl verify --context "${CLUSTER1_NAME}" --tocontext "${CLUSTER2_NAME}" --only service-discovery --verbose ${IMAGE_OVERRIDE} >> "${OUTPUT_DIR}/verify/service-discovery.txt" 2>&1 || echo "Service discovery verification failed or timed out" >> "${OUTPUT_DIR}/verify/service-discovery.txt"
+
+        # Run verify in background with progress monitoring
+        (
+            KUBECONFIG="${MERGED_KUBECONFIG}" subctl verify \
+                --context "${CLUSTER1_NAME}" \
+                --tocontext "${CLUSTER2_NAME}" \
+                --only service-discovery \
+                --connection-timeout 50 \
+                --verbose \
+                ${IMAGE_OVERRIDE} \
+                >> "${OUTPUT_DIR}/verify/service-discovery.txt" 2>&1
+        ) &
+        VERIFY_PID=$!
+
+        # Monitor progress and check for early-stop condition
+        elapsed=0
+        while kill -0 $VERIFY_PID 2>/dev/null; do
+            # Check timeout
+            if [ $elapsed -ge $VERIFY_TIMEOUT ]; then
+                echo "  ⚠ Service discovery test exceeded ${VERIFY_TIMEOUT}s timeout - terminating"
+                kill $VERIFY_PID 2>/dev/null
+                echo "" >> "${OUTPUT_DIR}/verify/service-discovery.txt"
+                echo "Verification terminated after ${VERIFY_TIMEOUT}s timeout" >> "${OUTPUT_DIR}/verify/service-discovery.txt"
+                break
+            fi
+
+            # Check if we should stop early due to consistent failures
+            if [ -f "${OUTPUT_DIR}/verify/service-discovery.txt" ]; then
+                completed_tests=$(grep -c "\[.*seconds\]" "${OUTPUT_DIR}/verify/service-discovery.txt" 2>/dev/null)
+                # Ensure it's a valid number
+                if ! [[ "$completed_tests" =~ ^[0-9]+$ ]]; then
+                    completed_tests=0
+                fi
+            else
+                completed_tests=0
+            fi
+
+            if [ "$completed_tests" -ge "$EARLY_STOP_THRESHOLD" 2>/dev/null ]; then
+                if ! grep -q "^Ran.*Specs" "${OUTPUT_DIR}/verify/service-discovery.txt" 2>/dev/null; then
+                    failure_blocks=$(grep -c "FAIL\|timed out\|refused" "${OUTPUT_DIR}/verify/service-discovery.txt" 2>/dev/null || echo "0")
+
+                    if [ "$failure_blocks" -ge "$EARLY_STOP_THRESHOLD" ]; then
+                        echo "  ⚠ First $completed_tests service discovery tests failing - stopping early to save time"
+                        echo "     (Collected enough diagnostic data to identify service discovery issues)"
+                        kill $VERIFY_PID 2>/dev/null
+                        echo "" >> "${OUTPUT_DIR}/verify/service-discovery.txt"
+                        echo "Verification stopped early after $completed_tests consecutive test failures" >> "${OUTPUT_DIR}/verify/service-discovery.txt"
+                        echo "This indicates systemic service discovery issues - see failed test details above" >> "${OUTPUT_DIR}/verify/service-discovery.txt"
+                        break
+                    fi
+                fi
+            fi
+
+            sleep $PROGRESS_INTERVAL
+            elapsed=$((elapsed + PROGRESS_INTERVAL))
+            if [ "$completed_tests" -gt 0 ]; then
+                echo "  ... still running (${elapsed}s elapsed, $completed_tests tests completed)"
+            else
+                echo "  ... still running (${elapsed}s elapsed)"
+            fi
+        done
+
+        wait $VERIFY_PID 2>/dev/null || echo "Service discovery verification failed or timed out" >> "${OUTPUT_DIR}/verify/service-discovery.txt"
         echo "  End time: $(date '+%Y-%m-%d %H:%M:%S')"
     else
         echo "Skipping service-discovery verification (not enabled on either cluster)"

@@ -1,6 +1,6 @@
 # Submariner Diagnostic Toolkit
 
-Comprehensive toolkit for collecting and analyzing Submariner diagnostics **offline** - no live cluster access required for analysis.
+Comprehensive toolkit for collecting and analyzing Submariner diagnostics. Collect diagnostics once from live clusters, then analyze **offline** anytime - no cluster access needed for analysis.
 
 ## Features
 
@@ -35,6 +35,7 @@ Comprehensive toolkit for collecting and analyzing Submariner diagnostics **offl
 **What it detects:**
 - Tunnel connectivity status
 - ESP/UDP protocol blocking
+- MTU/fragmentation issues
 - Pod health issues
 - Packet flow patterns (from tcpdump)
 - Common misconfigurations
@@ -50,25 +51,39 @@ For deeper analysis with Claude AI:
 
 **Installation:**
 ```bash
-# Copy the analysis skill to Claude Code
-mkdir -p ~/.config/claude-code/skills
-cp submariner-analyze-offline.md ~/.config/claude-code/skills/
+# Install the Claude Code skill (creates /submariner:analyze-offline command)
+mkdir -p ~/.claude/commands/submariner
+cp analyze-offline.md ~/.claude/commands/submariner/analyze-offline.md
 ```
 
+**Restart Claude Code**, then verify the command is available:
+```
+/submariner:analyze-offline
+```
+
+**Note:** The command will appear as `/submariner:analyze-offline` in Claude Code.
+
 **Usage:**
-Open Claude Code and run:
 ```
 /submariner:analyze-offline submariner-diagnostics-TIMESTAMP.tar.gz
+
+# Or with specific issue description
+/submariner:analyze-offline submariner-diagnostics-TIMESTAMP.tar.gz "tunnel not connected"
 ```
 
 **Prerequisites:**
 - [Claude Code](https://claude.com/claude-code) installed
 - Claude subscription
 
+**What it detects (in addition to basic analysis):**
+- **MTU/fragmentation issues** (classic pattern: small packets pass, large packets fail)
+- Infrastructure-level blocking patterns from tcpdump analysis
+- All issues detected by basic analysis
+
 **What it provides:**
 - Deep root cause analysis with context
 - Probabilistic reasoning ("most likely", "appears to be")
-- Step-by-step solutions
+- Step-by-step solutions with deployment-specific commands
 - Official documentation references
 - Further investigation steps if initial solution fails
 
@@ -179,7 +194,7 @@ Recommendations:
 
 ### 3. MTU Issues
 **Symptoms:** Large packets fail, small packets succeed
-**Basic Analysis:** ❌ Use advanced analysis
+**Basic Analysis:** ✅ Detects
 **Recommendation:** Apply TCP MSS clamping
 
 ### 4. Pod Health Issues
@@ -267,10 +282,11 @@ kubectl config get-contexts --kubeconfig /path/to/kubeconfig
 pip install pyyaml
 ```
 
-**Advanced analysis: Skill not found**
-- Verify `submariner-analyze-offline.md` copied to `~/.config/claude-code/skills/`
+**Advanced analysis: Command not found**
+- Verify `analyze-offline.md` is copied to `~/.claude/commands/submariner/analyze-offline.md`
 - Restart Claude Code
-- Try: `ls ~/.config/claude-code/skills/`
+- Verify installation: `ls ~/.claude/commands/submariner/`
+- Make sure there's NO file at `~/.claude/commands/analyze-offline.md` (would create duplicate command)
 
 ## Contributing
 
