@@ -62,6 +62,7 @@ pip install pyyaml
 **What it detects:**
 - Tunnel connectivity status
 - ESP/UDP protocol blocking
+- Firewall blocking (inter-cluster and intra-cluster)
 - MTU/fragmentation issues
 - Pod health issues
 - Packet flow patterns (from tcpdump)
@@ -136,12 +137,25 @@ cp analyze-offline.md ~/.claude/commands/submariner/analyze-offline.md
 - Includes text analysis summaries for offline review
 - **Benefit**: Identifies *where* packets are being dropped
 
+**Firewall inter-cluster diagnostics** (`subctl diagnose firewall inter-cluster`)
+- Runs when: Tunnel not connected + UDP encapsulation (VxLAN or IPSec NAT-T)
+- Skipped when: Using ESP (protocol 50) - test only checks UDP ports
+- **Benefit**: Verifies if UDP ports are open between gateway nodes
+- **Cross-referenced with**: tcpdump data (UDP traffic) + IPsec counters (ipsec-trafficstatus.log)
+
 #### When Tunnels Connected
 **subctl verify connectivity tests**
 - Default packet size tests
 - Small packet size tests (MTU detection)
 - Service discovery tests (if enabled)
 - **Benefit**: Validates end-to-end connectivity
+
+#### When CNI is NOT OVN-Kubernetes
+**Firewall intra-cluster diagnostics** (`subctl diagnose firewall intra-cluster`)
+- Runs per cluster when CNI is not OVNK (checked independently)
+- Runs regardless of tunnel status
+- **Benefit**: Verifies VXLAN traffic allowed on vx-submariner interface
+- **Expected failures**: RouteAgent issues + verify test failures from non-gateway pods
 
 ## Collection Script Features
 
@@ -234,6 +248,17 @@ Recommendations:
 **Basic Analysis:** ✅ Detects
 **Recommendation:** Check firewall/network between nodes
 
+### 6. Inter-Cluster Firewall Blocking
+**Symptoms:** Tunnel not connected, firewall inter-cluster test fails
+**Basic Analysis:** ✅ Detects (auto-detects NAT-T port from config)
+**Recommendation:** Allow UDP NAT-T port (default 4500, configurable) between gateway nodes
+**Cross-checked with:** tcpdump (UDP traffic patterns) + IPsec counters
+
+### 7. Intra-Cluster Firewall Blocking
+**Symptoms:** RouteAgent failures, verify tests fail from non-gateway pods
+**Basic Analysis:** ✅ Detects
+**Recommendation:** Allow VXLAN traffic on vx-submariner interface
+
 ## Output Structure
 
 ```
@@ -258,6 +283,10 @@ submariner-diagnostics-TIMESTAMP.tar.gz
     │   ├── cluster1-gateway-node-analysis.txt  # Text summary
     │   ├── cluster1-gateway-node.pcap          # Binary capture
     │   └── cluster2-gateway-...
+    ├── firewall/                     # Firewall diagnostics (conditional)
+    │   ├── firewall-inter-cluster.txt          # Inter-cluster firewall test
+    │   ├── firewall-intra-cluster-cluster1.txt # Intra-cluster (cluster1)
+    │   └── firewall-intra-cluster-cluster2.txt # Intra-cluster (cluster2)
     └── verify/                       # Connectivity tests (if tunnels up)
         ├── connectivity.txt
         ├── connectivity-small-packet.txt

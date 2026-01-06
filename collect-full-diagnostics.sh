@@ -245,6 +245,111 @@ EOF
     echo "  ✓ Cleanup complete"
 }
 
+# Function to collect firewall inter-cluster diagnostics
+collect_firewall_inter_cluster() {
+    local cluster1_name="$1"
+    local kubeconfig1="$2"
+    local cluster2_name="$3"
+    local kubeconfig2="$4"
+    local firewall_dir="$5"
+    local image_override="$6"
+
+    echo "=== Collecting firewall inter-cluster diagnostics ==="
+    echo "  This tests firewall requirements for inter-cluster traffic"
+
+    # Merge kubeconfigs temporarily for subctl diagnose firewall
+    MERGED_KUBECONFIG_FW="${firewall_dir}/merged-kubeconfig-fw"
+    KUBECONFIG="${kubeconfig1}:${kubeconfig2}" kubectl config view --flatten > "${MERGED_KUBECONFIG_FW}"
+
+    # Build command
+    FIREWALL_CMD="KUBECONFIG=${MERGED_KUBECONFIG_FW} subctl diagnose firewall inter-cluster --context ${cluster1_name} --remotecontext ${cluster2_name} --verbose"
+    if [ -n "$image_override" ]; then
+        FIREWALL_CMD="${FIREWALL_CMD} ${image_override}"
+    fi
+
+    echo "========================================" > "${firewall_dir}/firewall-inter-cluster.txt"
+    echo "Command executed:" >> "${firewall_dir}/firewall-inter-cluster.txt"
+    echo "${FIREWALL_CMD}" >> "${firewall_dir}/firewall-inter-cluster.txt"
+    echo "========================================" >> "${firewall_dir}/firewall-inter-cluster.txt"
+    echo "" >> "${firewall_dir}/firewall-inter-cluster.txt"
+    echo "CONTEXT: This test was run because:" >> "${firewall_dir}/firewall-inter-cluster.txt"
+    echo "  - Tunnel not connected on one or both clusters" >> "${firewall_dir}/firewall-inter-cluster.txt"
+    echo "  - Inter-cluster traffic uses UDP encapsulation (VxLAN or IPSec with NAT-T)" >> "${firewall_dir}/firewall-inter-cluster.txt"
+    echo "  - Testing if firewall rules are blocking inter-cluster traffic" >> "${firewall_dir}/firewall-inter-cluster.txt"
+    echo "" >> "${firewall_dir}/firewall-inter-cluster.txt"
+
+    echo "  Running firewall inter-cluster test..."
+    echo "  Start time: $(date '+%Y-%m-%d %H:%M:%S')"
+
+    # Run firewall test
+    KUBECONFIG="${MERGED_KUBECONFIG_FW}" subctl diagnose firewall inter-cluster \
+        --context "${cluster1_name}" \
+        --remotecontext "${cluster2_name}" \
+        --verbose \
+        ${image_override} \
+        >> "${firewall_dir}/firewall-inter-cluster.txt" 2>&1
+
+    FW_EXIT_CODE=$?
+    echo "  End time: $(date '+%Y-%m-%d %H:%M:%S')"
+
+    if [ $FW_EXIT_CODE -eq 0 ]; then
+        echo "  ✓ Firewall inter-cluster test completed successfully"
+    else
+        echo "  ⚠ Firewall inter-cluster test completed with errors (exit code: $FW_EXIT_CODE)"
+        echo "     Check firewall-inter-cluster.txt for details"
+    fi
+
+    # Cleanup merged kubeconfig
+    rm -f "${MERGED_KUBECONFIG_FW}"
+}
+
+# Function to collect firewall intra-cluster diagnostics
+collect_firewall_intra_cluster() {
+    local cluster_name="$1"
+    local kubeconfig="$2"
+    local firewall_dir="$3"
+    local image_override="$4"
+
+    echo "=== Collecting firewall intra-cluster diagnostics for ${cluster_name} ==="
+    echo "  This tests firewall requirements for intra-cluster Submariner traffic"
+
+    # Build command
+    FIREWALL_CMD="subctl diagnose firewall intra-cluster --kubeconfig ${kubeconfig} --verbose"
+    if [ -n "$image_override" ]; then
+        FIREWALL_CMD="${FIREWALL_CMD} ${image_override}"
+    fi
+
+    echo "========================================" > "${firewall_dir}/firewall-intra-cluster-${cluster_name}.txt"
+    echo "Command executed:" >> "${firewall_dir}/firewall-intra-cluster-${cluster_name}.txt"
+    echo "${FIREWALL_CMD}" >> "${firewall_dir}/firewall-intra-cluster-${cluster_name}.txt"
+    echo "========================================" >> "${firewall_dir}/firewall-intra-cluster-${cluster_name}.txt"
+    echo "" >> "${firewall_dir}/firewall-intra-cluster-${cluster_name}.txt"
+    echo "CONTEXT: This test was run because:" >> "${firewall_dir}/firewall-intra-cluster-${cluster_name}.txt"
+    echo "  - CNI is not OVN-Kubernetes (intra-cluster firewall requirements apply)" >> "${firewall_dir}/firewall-intra-cluster-${cluster_name}.txt"
+    echo "  - Testing if firewall rules are blocking intra-cluster Submariner traffic" >> "${firewall_dir}/firewall-intra-cluster-${cluster_name}.txt"
+    echo "" >> "${firewall_dir}/firewall-intra-cluster-${cluster_name}.txt"
+
+    echo "  Running firewall intra-cluster test for ${cluster_name}..."
+    echo "  Start time: $(date '+%Y-%m-%d %H:%M:%S')"
+
+    # Run firewall test
+    subctl diagnose firewall intra-cluster \
+        --kubeconfig "${kubeconfig}" \
+        --verbose \
+        ${image_override} \
+        >> "${firewall_dir}/firewall-intra-cluster-${cluster_name}.txt" 2>&1
+
+    FW_EXIT_CODE=$?
+    echo "  End time: $(date '+%Y-%m-%d %H:%M:%S')"
+
+    if [ $FW_EXIT_CODE -eq 0 ]; then
+        echo "  ✓ Firewall intra-cluster test for ${cluster_name} completed successfully"
+    else
+        echo "  ⚠ Firewall intra-cluster test for ${cluster_name} completed with errors (exit code: $FW_EXIT_CODE)"
+        echo "     Check firewall-intra-cluster-${cluster_name}.txt for details"
+    fi
+}
+
 # Check if all 5 parameters are provided
 if [ $# -ne 5 ]; then
     echo "ERROR: All 5 parameters are required"
@@ -420,6 +525,183 @@ else
     echo "  ✓ Tunnel connected on both clusters - skipping tcpdump collection"
     echo ""  >> "${OUTPUT_DIR}/manifest.txt"
     echo "tcpdump Collection: Skipped (tunnel connected on both clusters)" >> "${OUTPUT_DIR}/manifest.txt"
+fi
+
+# Firewall diagnostics collection
+echo ""
+echo "=== Checking firewall diagnostics requirements ==="
+mkdir -p "${OUTPUT_DIR}/firewall"
+
+# Determine if we should run inter-cluster firewall diagnostics
+# Case A: Inter-cluster firewall diagnostics
+# Requirements:
+#   1. At least one tunnel is NOT in connected state
+#   2. Cable driver uses UDP encapsulation (VxLAN OR IPSec with NAT-T)
+# Note: Skip if using IPSec with ESP (protocol 50) - diagnose firewall inter-cluster only checks UDP ports
+RUN_FIREWALL_INTER_CLUSTER=false
+
+if [ "$TUNNEL_STATUS_CLUSTER1" != "connected" ] || [ "$TUNNEL_STATUS_CLUSTER2" != "connected" ]; then
+    echo "Checking if inter-cluster firewall diagnostics should run..."
+    echo "  Reason: At least one tunnel is not in connected state"
+
+    # Get cable driver and encapsulation info from cluster1
+    CABLE_DRIVER_C1=$(kubectl get submariner submariner -n submariner-operator --kubeconfig="${KUBECONFIG1}" -o jsonpath='{.spec.cableDriver}' 2>/dev/null)
+    CABLE_DRIVER_C1=${CABLE_DRIVER_C1:-libreswan}
+    USING_IP_C1=$(kubectl get submariner submariner -n submariner-operator --kubeconfig="${KUBECONFIG1}" -o jsonpath='{.status.gateways[0].connections[0].usingIP}' 2>/dev/null)
+    PRIVATE_IP_C1=$(kubectl get submariner submariner -n submariner-operator --kubeconfig="${KUBECONFIG1}" -o jsonpath='{.status.gateways[0].connections[0].endpoint.private_ip}' 2>/dev/null)
+    FORCE_UDP_C1=$(kubectl get submariner submariner -n submariner-operator --kubeconfig="${KUBECONFIG1}" -o jsonpath='{.spec.ceIPSecForceUDPEncaps}' 2>/dev/null)
+    NATT_PORT_C1=$(kubectl get submariner submariner -n submariner-operator --kubeconfig="${KUBECONFIG1}" -o jsonpath='{.spec.ceIPSecNATTPort}' 2>/dev/null)
+    NATT_PORT_C1=${NATT_PORT_C1:-4500}  # Default to 4500 if not set
+
+    # Determine if using UDP encapsulation
+    USING_UDP_ENCAP=false
+    if [ "$CABLE_DRIVER_C1" = "vxlan" ]; then
+        USING_UDP_ENCAP=true
+        echo "  Cable driver: VxLAN (uses UDP encapsulation on port ${NATT_PORT_C1})"
+    elif [ "$CABLE_DRIVER_C1" = "libreswan" ] || [ "$CABLE_DRIVER_C1" = "ipsec" ]; then
+        if [ "$FORCE_UDP_C1" = "true" ] || ( [ -n "$USING_IP_C1" ] && [ -n "$PRIVATE_IP_C1" ] && [ "$USING_IP_C1" != "$PRIVATE_IP_C1" ] ); then
+            USING_UDP_ENCAP=true
+            echo "  Cable driver: IPSec with UDP encapsulation (NAT-T port ${NATT_PORT_C1})"
+        else
+            echo "  Cable driver: IPSec with ESP (protocol 50, no UDP encapsulation)"
+            echo "  → 'diagnose firewall inter-cluster' is not useful for ESP - it only checks UDP ports"
+            echo "  → Will rely on tcpdump data from gateway nodes instead"
+        fi
+    else
+        echo "  Cable driver: ${CABLE_DRIVER_C1}"
+    fi
+
+    if [ "$USING_UDP_ENCAP" = "true" ]; then
+        RUN_FIREWALL_INTER_CLUSTER=true
+        echo "  ✓ Will run inter-cluster firewall diagnostics (tunnel not connected + UDP encapsulation)"
+    else
+        echo "  → Skipping inter-cluster firewall diagnostics (not using UDP encapsulation)"
+    fi
+else
+    echo "  → Skipping inter-cluster firewall diagnostics (tunnels connected on both clusters)"
+fi
+
+# Run inter-cluster firewall diagnostics if conditions are met
+if [ "$RUN_FIREWALL_INTER_CLUSTER" = "true" ]; then
+    echo ""
+    echo "Firewall Inter-Cluster Diagnostics:" >> "${OUTPUT_DIR}/manifest.txt"
+    echo "  Reason: Tunnel not connected + UDP encapsulation detected" >> "${OUTPUT_DIR}/manifest.txt"
+    echo "  Cable driver: ${CABLE_DRIVER_C1}" >> "${OUTPUT_DIR}/manifest.txt"
+    echo "  NAT-T port: ${NATT_PORT_C1}" >> "${OUTPUT_DIR}/manifest.txt"
+    echo "" >> "${OUTPUT_DIR}/manifest.txt"
+
+    # Use IMAGE_OVERRIDE variable if already set from verify section, otherwise detect it
+    if [ -z "$IMAGE_OVERRIDE" ]; then
+        # Quick registry check (simplified version)
+        echo "Checking image registry accessibility..."
+        RH_REGISTRY_OK=true
+        kubectl run fw-registry-check --image=registry.redhat.io/rhacm2/nettest:0.21.0 --restart=Never --kubeconfig="${KUBECONFIG1}" --command -- sleep 1 >/dev/null 2>&1
+        sleep 2
+        POD_STATUS=$(kubectl get pod fw-registry-check --kubeconfig="${KUBECONFIG1}" -o jsonpath='{.status.containerStatuses[0].state}' 2>/dev/null)
+        if ! echo "$POD_STATUS" | grep -qE "running|terminated|waiting.*PodInitializing|waiting.*ContainerCreating"; then
+            RH_REGISTRY_OK=false
+        fi
+        kubectl delete pod fw-registry-check --kubeconfig="${KUBECONFIG1}" --wait=false >/dev/null 2>&1
+
+        if [ "$RH_REGISTRY_OK" = "false" ]; then
+            FIREWALL_IMAGE_OVERRIDE="--image-override submariner-nettest=quay.io/submariner/nettest:devel"
+        else
+            FIREWALL_IMAGE_OVERRIDE=""
+        fi
+    else
+        FIREWALL_IMAGE_OVERRIDE="$IMAGE_OVERRIDE"
+    fi
+
+    collect_firewall_inter_cluster "${CLUSTER1_NAME}" "${KUBECONFIG1}" "${CLUSTER2_NAME}" "${KUBECONFIG2}" "${OUTPUT_DIR}/firewall" "${FIREWALL_IMAGE_OVERRIDE}"
+else
+    echo "" >> "${OUTPUT_DIR}/manifest.txt"
+    echo "Firewall Inter-Cluster Diagnostics: Skipped (requirements not met)" >> "${OUTPUT_DIR}/manifest.txt"
+fi
+
+# Determine if we should run intra-cluster firewall diagnostics
+# Case B: Intra-cluster firewall diagnostics
+# Requirements:
+#   1. CNI is NOT OVN-Kubernetes (checked per cluster independently)
+#   2. Runs REGARDLESS of tunnel status
+# Note: If there are intra-cluster firewall issues, we expect to see:
+#   - Failures in RouteAgent resources
+#   - subctl verify tests from pods on non-gateway nodes should fail
+echo ""
+echo "Checking if intra-cluster firewall diagnostics should run (Case B)..."
+echo "  Note: This is checked per cluster and runs regardless of tunnel status"
+
+# Detect CNI from both clusters
+# Note: This detection happens before the verify section, so we need to check if gather has completed
+CNI_CLUSTER1=""
+CNI_CLUSTER2=""
+if [ -f "${OUTPUT_DIR}/cluster1/gather/cluster1/summary.html" ]; then
+    CNI_CLUSTER1=$(grep -A 1 "CNI Plugin:" "${OUTPUT_DIR}/cluster1/gather/cluster1/summary.html" 2>/dev/null | grep -oP '<td>\K[^<]+' | tail -1 | tr -d '[:space:]')
+fi
+if [ -f "${OUTPUT_DIR}/cluster2/gather/cluster2/summary.html" ]; then
+    CNI_CLUSTER2=$(grep -A 1 "CNI Plugin:" "${OUTPUT_DIR}/cluster2/gather/cluster2/summary.html" 2>/dev/null | grep -oP '<td>\K[^<]+' | tail -1 | tr -d '[:space:]')
+fi
+
+echo "  Cluster1 CNI: ${CNI_CLUSTER1:-unknown}"
+echo "  Cluster2 CNI: ${CNI_CLUSTER2:-unknown}"
+
+# Check each cluster independently
+RUN_FIREWALL_INTRA_CLUSTER1=false
+if [ "$CNI_CLUSTER1" != "OVNKubernetes" ] && [ -n "$CNI_CLUSTER1" ]; then
+    RUN_FIREWALL_INTRA_CLUSTER1=true
+    echo "  ✓ Will run intra-cluster firewall diagnostics for cluster1 (CNI is ${CNI_CLUSTER1})"
+else
+    echo "  → Skipping intra-cluster firewall diagnostics for cluster1 (CNI is OVNK or unknown)"
+fi
+
+RUN_FIREWALL_INTRA_CLUSTER2=false
+if [ "$CNI_CLUSTER2" != "OVNKubernetes" ] && [ -n "$CNI_CLUSTER2" ]; then
+    RUN_FIREWALL_INTRA_CLUSTER2=true
+    echo "  ✓ Will run intra-cluster firewall diagnostics for cluster2 (CNI is ${CNI_CLUSTER2})"
+else
+    echo "  → Skipping intra-cluster firewall diagnostics for cluster2 (CNI is OVNK or unknown)"
+fi
+
+# Setup image override if needed (for both clusters)
+if [ "$RUN_FIREWALL_INTRA_CLUSTER1" = "true" ] || [ "$RUN_FIREWALL_INTRA_CLUSTER2" = "true" ]; then
+    # Use the same image override as inter-cluster if available
+    if [ -z "$FIREWALL_IMAGE_OVERRIDE" ]; then
+        # Quick registry check if not done already
+        echo "Checking image registry accessibility..."
+        RH_REGISTRY_OK=true
+        kubectl run fw-intra-registry-check --image=registry.redhat.io/rhacm2/nettest:0.21.0 --restart=Never --kubeconfig="${KUBECONFIG1}" --command -- sleep 1 >/dev/null 2>&1
+        sleep 2
+        POD_STATUS=$(kubectl get pod fw-intra-registry-check --kubeconfig="${KUBECONFIG1}" -o jsonpath='{.status.containerStatuses[0].state}' 2>/dev/null)
+        if ! echo "$POD_STATUS" | grep -qE "running|terminated|waiting.*PodInitializing|waiting.*ContainerCreating"; then
+            RH_REGISTRY_OK=false
+        fi
+        kubectl delete pod fw-intra-registry-check --kubeconfig="${KUBECONFIG1}" --wait=false >/dev/null 2>&1
+
+        if [ "$RH_REGISTRY_OK" = "false" ]; then
+            FIREWALL_IMAGE_OVERRIDE="--image-override submariner-nettest=quay.io/submariner/nettest:devel"
+        else
+            FIREWALL_IMAGE_OVERRIDE=""
+        fi
+    fi
+fi
+
+# Run intra-cluster firewall diagnostics for cluster1 (independent of cluster2)
+if [ "$RUN_FIREWALL_INTRA_CLUSTER1" = "true" ]; then
+    echo ""
+    echo "Firewall Intra-Cluster Diagnostics (Cluster1):" >> "${OUTPUT_DIR}/manifest.txt"
+    echo "  Reason: CNI is ${CNI_CLUSTER1} (not OVNK)" >> "${OUTPUT_DIR}/manifest.txt"
+    echo "" >> "${OUTPUT_DIR}/manifest.txt"
+
+    collect_firewall_intra_cluster "cluster1" "${KUBECONFIG1}" "${OUTPUT_DIR}/firewall" "${FIREWALL_IMAGE_OVERRIDE}"
+fi
+
+# Run intra-cluster firewall diagnostics for cluster2 (independent of cluster1)
+if [ "$RUN_FIREWALL_INTRA_CLUSTER2" = "true" ]; then
+    echo ""
+    echo "Firewall Intra-Cluster Diagnostics (Cluster2):" >> "${OUTPUT_DIR}/manifest.txt"
+    echo "  Reason: CNI is ${CNI_CLUSTER2} (not OVNK)" >> "${OUTPUT_DIR}/manifest.txt"
+    echo "" >> "${OUTPUT_DIR}/manifest.txt"
+
+    collect_firewall_intra_cluster "cluster2" "${KUBECONFIG2}" "${OUTPUT_DIR}/firewall" "${FIREWALL_IMAGE_OVERRIDE}"
 fi
 
 # Run connectivity verification
@@ -923,6 +1205,21 @@ echo "  - Cluster 2 diagnostics (subctl gather, show, diagnose)"
 
 if [ "$TUNNEL_STATUS_CLUSTER1" != "connected" ] || [ "$TUNNEL_STATUS_CLUSTER2" != "connected" ]; then
     echo "  - tcpdump packet captures from gateway nodes (tunnel not connected)"
+fi
+
+# Show firewall diagnostics summary
+if [ "$RUN_FIREWALL_INTER_CLUSTER" = "true" ]; then
+    echo "  - Firewall inter-cluster diagnostics"
+fi
+
+if [ "$RUN_FIREWALL_INTRA_CLUSTER1" = "true" ] || [ "$RUN_FIREWALL_INTRA_CLUSTER2" = "true" ]; then
+    if [ "$RUN_FIREWALL_INTRA_CLUSTER1" = "true" ] && [ "$RUN_FIREWALL_INTRA_CLUSTER2" = "true" ]; then
+        echo "  - Firewall intra-cluster diagnostics (both clusters)"
+    elif [ "$RUN_FIREWALL_INTRA_CLUSTER1" = "true" ]; then
+        echo "  - Firewall intra-cluster diagnostics (cluster1)"
+    else
+        echo "  - Firewall intra-cluster diagnostics (cluster2)"
+    fi
 fi
 
 if [ "$SKIP_VERIFY" = "true" ]; then

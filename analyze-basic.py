@@ -146,6 +146,9 @@ class SubmarinerAnalyzer:
         # Check verify tests
         self.check_verify_tests()
 
+        # Check firewall diagnostics
+        self.check_firewall_diagnostics()
+
         if not self.faulty_states:
             print(f"\n{Colors.OKGREEN}✓ No faulty states detected - Submariner deployment appears healthy{Colors.ENDC}")
             return False
@@ -351,6 +354,146 @@ class SubmarinerAnalyzer:
                 all_passed = False
 
             self.verify_tests_passed = all_passed
+
+    def check_firewall_diagnostics(self):
+        """
+        Check firewall diagnostics results (inter-cluster and intra-cluster)
+
+        Inter-cluster: Only runs when at least one tunnel is NOT connected AND using UDP encapsulation (VxLAN or IPSec NAT-T)
+        Intra-cluster: Only runs when CNI is NOT OVN-Kubernetes (checked per cluster)
+
+        Also cross-references:
+        - tcpdump data (for UDP traffic patterns)
+        - IPsec counters from gather data (for IPsec tunnel analysis)
+        """
+        firewall_dir = os.path.join(self.diagnostics_dir, "firewall")
+        if not os.path.exists(firewall_dir):
+            return
+
+        firewall_issues_found = False
+
+        # Detect NAT-T port from Submariner CR (default 4500)
+        natt_port = 4500  # default
+        submariner_yaml = self.read_yaml("cluster1/gather/cluster1/submariners_submariner-operator_submariner.yaml")
+        if submariner_yaml and 'spec' in submariner_yaml and 'ceIPSecNATTPort' in submariner_yaml['spec']:
+            natt_port = submariner_yaml['spec']['ceIPSecNATTPort']
+
+        # Check inter-cluster firewall diagnostics
+        # Prerequisites: At least one tunnel NOT connected + UDP encapsulation (VxLAN or IPSec NAT-T)
+        inter_cluster = self.read_file("firewall/firewall-inter-cluster.txt")
+        if inter_cluster:
+            print(f"\n{Colors.BOLD}=== Firewall Inter-Cluster Diagnostics ==={Colors.ENDC}")
+            print(f"  Prerequisites: Tunnel not connected + UDP encapsulation (VxLAN/IPSec NAT-T)")
+
+            # Check for successful completion
+            if "Tunnels can be established" in inter_cluster and "✓" in inter_cluster:
+                print(f"  {Colors.OKGREEN}✓{Colors.ENDC} Inter-cluster firewall: PASSED")
+                print(f"    UDP ports are open - firewall is NOT blocking tunnel traffic")
+                self.recommendations.append("Firewall is OK - investigate other tunnel issues: routing, IPsec config, or endpoint reachability")
+
+                # Cross-reference with IPsec counters if available
+                self.recommendations.append("Check IPsec counters in gather data (ipsec-trafficstatus.log) to verify traffic flow")
+            elif "CONTEXT: This test was run because:" in inter_cluster:
+                # Test ran - check for failures
+                if "error" in inter_cluster.lower() or "fail" in inter_cluster.lower() or "cannot" in inter_cluster.lower() or "timed out" in inter_cluster.lower():
+                    firewall_issues_found = True
+                    self.faulty_states.append("Inter-cluster firewall blocking UDP traffic")
+                    print(f"  {Colors.FAIL}✗{Colors.ENDC} Inter-cluster firewall: FAILED")
+                    print(f"    UDP ports blocked by firewall/security groups")
+
+                    # Cross-reference with tcpdump data
+                    tcpdump_dir = os.path.join(self.diagnostics_dir, "tcpdump")
+                    if os.path.exists(tcpdump_dir):
+                        print(f"    {Colors.WARNING}Additional data:{Colors.ENDC} Check tcpdump/ for UDP traffic patterns")
+                        print(f"      - Look for outbound UDP packets on port {natt_port} (NAT-T)")
+                        print(f"      - Check if UDP packets are egressing but not ingressing")
+
+                    # Reference IPsec counters
+                    print(f"    {Colors.WARNING}Additional data:{Colors.ENDC} Check IPsec counters in gather/")
+                    print(f"      - cluster*/gather/cluster*/ipsec-trafficstatus.log")
+                    print(f"      - Look for 0 bytes in/out indicating no traffic flow")
+
+                    self.recommendations.append(f"Fix inter-cluster firewall: allow UDP traffic on NAT-T port {natt_port} between gateway nodes")
+                    self.recommendations.append("Cloud environments: Check security group rules between gateway node IPs")
+                    self.recommendations.append(f"On-premise: Verify firewall allows UDP {natt_port} or ESP (protocol 50) depending on cable driver config")
+                    self.recommendations.append(f"Cross-check tcpdump data: verify UDP packets on port {natt_port} are flowing in both directions")
+                    self.recommendations.append("Check IPsec traffic counters: ipsec-trafficstatus.log should show non-zero bytes if traffic flowing")
+
+                    # Extract specific error
+                    error_match = re.search(r'(error|Error|ERROR|FAILED|timeout)[^\n]*', inter_cluster)
+                    if error_match:
+                        print(f"    Error: {error_match.group(0)}")
+                else:
+                    print(f"  {Colors.OKGREEN}✓{Colors.ENDC} Inter-cluster firewall: PASSED")
+                    self.recommendations.append("Firewall OK - check other tunnel issues (routing, IPsec, endpoints)")
+                    self.recommendations.append("Verify IPsec counters in ipsec-trafficstatus.log show traffic flowing")
+
+        # Check intra-cluster firewall diagnostics for cluster1
+        # Prerequisites: CNI is NOT OVN-Kubernetes
+        # Expected symptoms if failed: RouteAgent failures + verify test failures from non-gateway pods
+        intra_cluster1 = self.read_file("firewall/firewall-intra-cluster-cluster1.txt")
+        if intra_cluster1:
+            print(f"\n{Colors.BOLD}=== Firewall Intra-Cluster Diagnostics (Cluster1) ==={Colors.ENDC}")
+            print(f"  Prerequisites: CNI is NOT OVN-Kubernetes")
+
+            # Check for successful completion
+            if "firewall configuration allows intra-cluster VXLAN traffic" in intra_cluster1 and "✓" in intra_cluster1:
+                print(f"  {Colors.OKGREEN}✓{Colors.ENDC} Intra-cluster firewall (cluster1): PASSED")
+
+                # Check tcpdump packet count
+                packet_match = re.search(r'(\d+)\s+packets captured', intra_cluster1)
+                if packet_match:
+                    packet_count = int(packet_match.group(1))
+                    if packet_count > 0:
+                        print(f"    {packet_count} packets on vx-submariner - VXLAN traffic flowing")
+                    else:
+                        print(f"    {Colors.WARNING}⚠{Colors.ENDC} 0 packets captured (might be low traffic, not necessarily firewall issue)")
+            elif "CONTEXT: This test was run because:" in intra_cluster1:
+                # Test ran - check for failures
+                if "error" in intra_cluster1.lower() or "fail" in intra_cluster1.lower():
+                    firewall_issues_found = True
+                    self.faulty_states.append("Intra-cluster firewall blocking VXLAN on cluster1")
+                    print(f"  {Colors.FAIL}✗{Colors.ENDC} Intra-cluster firewall (cluster1): FAILED")
+                    print(f"    VXLAN traffic blocked on vx-submariner interface")
+                    print(f"    {Colors.WARNING}Expected symptoms:{Colors.ENDC}")
+                    print(f"      • RouteAgent failures on cluster1")
+                    print(f"      • subctl verify tests fail when pods scheduled on non-gateway nodes")
+                    self.recommendations.append("Fix intra-cluster firewall on cluster1: allow VXLAN traffic on vx-submariner interface")
+                    self.recommendations.append("Verify RouteAgent status on cluster1")
+                    self.recommendations.append("Check verify tests: failures from non-gateway pods indicate intra-cluster firewall issues")
+
+        # Check intra-cluster firewall diagnostics for cluster2
+        # Prerequisites: CNI is NOT OVN-Kubernetes
+        intra_cluster2 = self.read_file("firewall/firewall-intra-cluster-cluster2.txt")
+        if intra_cluster2:
+            print(f"\n{Colors.BOLD}=== Firewall Intra-Cluster Diagnostics (Cluster2) ==={Colors.ENDC}")
+            print(f"  Prerequisites: CNI is NOT OVN-Kubernetes")
+
+            # Check for successful completion
+            if "firewall configuration allows intra-cluster VXLAN traffic" in intra_cluster2 and "✓" in intra_cluster2:
+                print(f"  {Colors.OKGREEN}✓{Colors.ENDC} Intra-cluster firewall (cluster2): PASSED")
+
+                # Check tcpdump packet count
+                packet_match = re.search(r'(\d+)\s+packets captured', intra_cluster2)
+                if packet_match:
+                    packet_count = int(packet_match.group(1))
+                    if packet_count > 0:
+                        print(f"    {packet_count} packets on vx-submariner - VXLAN traffic flowing")
+                    else:
+                        print(f"    {Colors.WARNING}⚠{Colors.ENDC} 0 packets captured (might be low traffic, not necessarily firewall issue)")
+            elif "CONTEXT: This test was run because:" in intra_cluster2:
+                # Test ran - check for failures
+                if "error" in intra_cluster2.lower() or "fail" in intra_cluster2.lower():
+                    firewall_issues_found = True
+                    self.faulty_states.append("Intra-cluster firewall blocking VXLAN on cluster2")
+                    print(f"  {Colors.FAIL}✗{Colors.ENDC} Intra-cluster firewall (cluster2): FAILED")
+                    print(f"    VXLAN traffic blocked on vx-submariner interface")
+                    print(f"    {Colors.WARNING}Expected symptoms:{Colors.ENDC}")
+                    print(f"      • RouteAgent failures on cluster2")
+                    print(f"      • subctl verify tests fail when pods scheduled on non-gateway nodes")
+                    self.recommendations.append("Fix intra-cluster firewall on cluster2: allow VXLAN traffic on vx-submariner interface")
+                    self.recommendations.append("Verify RouteAgent status on cluster2")
+                    self.recommendations.append("Check verify tests: failures from non-gateway pods indicate intra-cluster firewall issues")
 
     def analyze_tunnel_status(self):
         """Analyze tunnel connectivity status in detail"""
