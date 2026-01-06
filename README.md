@@ -8,6 +8,33 @@ Comprehensive toolkit for collecting and analyzing Submariner diagnostics. Colle
 - **Basic Analysis** (Python): Fast pattern-matching for common issues - no AI required
 - **Advanced Analysis** (Claude Code): Deep AI-powered root cause analysis
 
+## Getting Started
+
+### Installation
+
+**1. Clone the repository:**
+```bash
+git clone https://github.com/yboaron/submariner-diagnostic-toolkit.git
+cd submariner-diagnostic-toolkit
+```
+
+**2. Verify prerequisites:**
+```bash
+# Required for collection
+kubectl version --client
+subctl version
+
+# Required for basic analysis (optional)
+python3 --version
+pip install pyyaml
+```
+
+**Prerequisites:**
+- `kubectl` - [Installation Guide](https://kubernetes.io/docs/tasks/tools/)
+- `subctl` - [Installation Guide](https://github.com/submariner-io/subctl)
+- `python3` and `pyyaml` - Only needed for basic analysis (optional)
+- Access to both Submariner clusters with valid kubeconfig files
+
 ## Quick Start
 
 ### 1. Collect Diagnostics
