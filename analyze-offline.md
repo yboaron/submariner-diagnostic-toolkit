@@ -197,7 +197,8 @@ Based on the complaint, route to appropriate analysis:
 #### F. For Connectivity Issues:
 1. `verify/connectivity.txt` - Default packet size results
 2. `verify/connectivity-small-packet.txt` - Small packet size results (for MTU issues)
-3. Gateway CR and logs (same as tunnel issues)
+3. `verify/connectivity-skip-src-ip-check.txt` - OVNK SNAT workaround test (if exists - only generated when OVNK detected and connectivity failed)
+4. Gateway CR and logs (same as tunnel issues)
 
 Note: The verify files contain the actual command executed at the top. Check if:
 - The same context was used for both --context and --tocontext (common mistake)
@@ -503,6 +504,50 @@ Adjust based on your network MTU if needed.
 - Health check pings use small ICMP packets, so if health checks fail, MTU is NOT the root cause
 - MTU issues only appear with large data transfers, not control plane
 - Tunnels may show "connected" status even with MTU issues (health checks still work)
+
+#### **Analysis 2b: OVNK SNAT Issues**
+
+**IMPORTANT:** Check for OVNK-specific SNAT connectivity issues
+
+Read:
+- `verify/connectivity.txt` - Regular connectivity test results
+- `verify/connectivity-skip-src-ip-check.txt` - Connectivity with OVNK SNAT workaround (if file exists)
+- `cluster*/gather/cluster*/summary.html` - To detect CNI plugin (look for "CNI Plugin: OVNKubernetes" in HTML table)
+
+**OVNK SNAT Issue Pattern (DEFINITIVE):**
+- Regular connectivity test FAILS
+- Connectivity with `--skip-src-ip-check` PASSES
+- CNI is OVNKubernetes (detect from summary.html)
+
+→ **ROOT CAUSE: OVNK SNAT breaking Submariner connectivity** (high confidence)
+
+**Why this indicates OVNK SNAT issue:**
+- OVNK performs SNAT (Source Network Address Translation) on pod traffic
+- This SNAT changes the source IP of packets, breaking Submariner's source IP validation
+- The `--skip-src-ip-check` flag bypasses this validation, allowing connectivity
+- This is a known incompatibility between certain OVNK versions and Submariner
+
+**Solution: Apply OVNK Fix for Submariner**
+
+Some OVNK releases include a fix for Submariner compatibility that prevents SNAT from breaking cross-cluster traffic.
+
+**Check OVNK version and available fixes:**
+1. Verify your OVNK version
+2. Check if your OVNK release includes the Submariner SNAT fix
+3. If available, apply the fix following OVNK documentation
+4. If not available, consider upgrading OVNK or using a workaround
+
+**Workaround (NOT recommended for production):**
+Using `--skip-src-ip-check` is NOT recommended for production as it bypasses security validation. Only use for testing/diagnosis.
+
+📖 **Reference:** Check OVNK release notes and Submariner compatibility documentation
+
+**Important Notes:**
+- This issue ONLY affects clusters using OVN-Kubernetes CNI
+- The `connectivity-skip-src-ip-check.txt` file is only generated if:
+  - Regular connectivity tests failed
+  - OVNK CNI was detected during collection
+- If this file doesn't exist, OVNK SNAT is not the issue
 
 #### **Analysis 3: RouteAgent Health**
 

@@ -100,6 +100,19 @@ class SubmarinerAnalyzer:
                 manifest[key.strip()] = value.strip()
         return manifest
 
+    def detect_cni(self, cluster):
+        """Detect CNI plugin from summary.html"""
+        summary_html = self.read_file(f"{cluster}/gather/{cluster}/summary.html")
+        if not summary_html:
+            return "unknown"
+
+        # Look for CNI Plugin in HTML table
+        import re
+        match = re.search(r'<td>CNI Plugin:</td>\s*<td>([^<]+)</td>', summary_html)
+        if match:
+            return match.group(1).strip()
+        return "unknown"
+
     def check_faulty_states(self):
         """Check for faulty states before starting deep analysis"""
         print(f"\n{Colors.BOLD}=== Checking for Faulty States ==={Colors.ENDC}")
@@ -293,6 +306,38 @@ class SubmarinerAnalyzer:
                     svc_discovery_failed = True
                     self.faulty_states.append("Service discovery verification inconclusive")
                     print(f"  {Colors.WARNING}⚠{Colors.ENDC} Service discovery verification: INCONCLUSIVE")
+
+        # Check for OVNK SNAT issue pattern
+        skip_src_ip_check = self.read_file("verify/connectivity-skip-src-ip-check.txt")
+        if skip_src_ip_check:
+            skip_src_ip_passed = False
+            skip_src_ip_failed = False
+
+            # Check if skip-src-ip-check test passed
+            if "SUCCESS!" in skip_src_ip_check or (re.search(r'\d+\s+Passed.*0\s+Failed', skip_src_ip_check)):
+                skip_src_ip_passed = True
+                print(f"  {Colors.OKGREEN}✓{Colors.ENDC} Connectivity with --skip-src-ip-check: PASSED")
+            elif re.search(r'[1-9]\d*\s+Failed', skip_src_ip_check) or "FAILURE" in skip_src_ip_check or "FAIL" in skip_src_ip_check:
+                skip_src_ip_failed = True
+                print(f"  {Colors.FAIL}✗{Colors.ENDC} Connectivity with --skip-src-ip-check: FAILED")
+
+            # Detect OVNK SNAT issue: regular connectivity failed but skip-src-ip-check passed
+            if connectivity_failed and skip_src_ip_passed:
+                # Detect CNI to confirm OVNK
+                cni_cluster1 = self.detect_cni("cluster1")
+                cni_cluster2 = self.detect_cni("cluster2")
+
+                print(f"\n  {Colors.FAIL}✗ OVNK SNAT ISSUE DETECTED:{Colors.ENDC}")
+                print(f"    Regular connectivity tests: FAILED")
+                print(f"    Connectivity with --skip-src-ip-check: PASSED")
+                print(f"    CNI detected: Cluster1={cni_cluster1}, Cluster2={cni_cluster2}")
+                print(f"    → This indicates OVNK SNAT is breaking Submariner connectivity")
+                self.faulty_states.append("OVNK SNAT issue detected (regular connectivity fails, --skip-src-ip-check passes)")
+                self.issues.append(f"OVNK CNI SNAT prevents Submariner cross-cluster connectivity (CNI: {cni_cluster1}/{cni_cluster2})")
+                self.recommendations.insert(0, "OVNK SNAT Issue: Apply the OVNK fix for Submariner compatibility")
+                self.recommendations.insert(1, "Check if your OVNK version has the Submariner SNAT fix available")
+                self.recommendations.insert(2, "See: https://github.com/ovn-org/ovn-kubernetes/pull/XXXXX (OVNK fix for Submariner)")
+                self.recommendations.insert(3, "Workaround: Use --skip-src-ip-check flag for testing (not recommended for production)")
 
         # Set verify_tests_passed only if ALL tests that ran passed
         if tests_found:

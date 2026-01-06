@@ -806,6 +806,92 @@ if [ "$SKIP_VERIFY" = "false" ]; then
         echo "To enable service discovery, see: https://submariner.io/getting-started/quickstart/openshift/service-discovery/" >> "${OUTPUT_DIR}/verify/service-discovery.txt"
     fi
 
+    # Check for OVNK-specific SNAT issue
+    echo ""
+    echo "Checking for OVNK-specific issues..."
+
+    # Detect CNI from both clusters using summary.html (more reliable than subctl show output)
+    CNI_CLUSTER1=$(grep -A 1 "CNI Plugin:" "${OUTPUT_DIR}/cluster1/gather/cluster1/summary.html" 2>/dev/null | grep -oP '<td>\K[^<]+' | tail -1 | tr -d '[:space:]')
+    CNI_CLUSTER2=$(grep -A 1 "CNI Plugin:" "${OUTPUT_DIR}/cluster2/gather/cluster2/summary.html" 2>/dev/null | grep -oP '<td>\K[^<]+' | tail -1 | tr -d '[:space:]')
+
+    echo "  Cluster1 CNI: ${CNI_CLUSTER1:-unknown}"
+    echo "  Cluster2 CNI: ${CNI_CLUSTER2:-unknown}"
+
+    # Check if either cluster uses OVNK (OVNKubernetes)
+    OVNK_DETECTED=false
+    if [[ "$CNI_CLUSTER1" == "OVNKubernetes" ]] || [[ "$CNI_CLUSTER2" == "OVNKubernetes" ]]; then
+        OVNK_DETECTED=true
+        echo "  ✓ OVNK CNI detected - will check for SNAT issue if connectivity tests failed"
+    else
+        echo "  → No OVNK CNI detected - skipping OVNK-specific tests"
+    fi
+
+    # Check if connectivity tests failed
+    CONNECTIVITY_FAILED=false
+    if [ -f "${OUTPUT_DIR}/verify/connectivity.txt" ]; then
+        if grep -qE "FAIL|Failed|timed out|stopped early" "${OUTPUT_DIR}/verify/connectivity.txt" 2>/dev/null; then
+            CONNECTIVITY_FAILED=true
+        fi
+    fi
+
+    # If OVNK detected AND connectivity failed, run verify with --skip-src-ip-check
+    if [ "$OVNK_DETECTED" = "true" ] && [ "$CONNECTIVITY_FAILED" = "true" ]; then
+        echo ""
+        echo "Running additional verify test with --skip-src-ip-check (OVNK SNAT workaround)..."
+        echo "  This helps identify if OVNK SNAT is causing connectivity issues"
+        echo "  Start time: $(date '+%Y-%m-%d %H:%M:%S')"
+        echo ""
+
+        VERIFY_CMD="KUBECONFIG=${MERGED_KUBECONFIG} subctl verify --context ${CLUSTER1_NAME} --tocontext ${CLUSTER2_NAME} --only connectivity --connection-timeout 50 --verbose --skip-src-ip-check ${IMAGE_OVERRIDE}"
+        echo "========================================" > "${OUTPUT_DIR}/verify/connectivity-skip-src-ip-check.txt"
+        echo "Command executed:" >> "${OUTPUT_DIR}/verify/connectivity-skip-src-ip-check.txt"
+        echo "${VERIFY_CMD}" >> "${OUTPUT_DIR}/verify/connectivity-skip-src-ip-check.txt"
+        echo "========================================" >> "${OUTPUT_DIR}/verify/connectivity-skip-src-ip-check.txt"
+        echo "" >> "${OUTPUT_DIR}/verify/connectivity-skip-src-ip-check.txt"
+        echo "CONTEXT: This test was run because:" >> "${OUTPUT_DIR}/verify/connectivity-skip-src-ip-check.txt"
+        echo "  - Regular connectivity tests failed" >> "${OUTPUT_DIR}/verify/connectivity-skip-src-ip-check.txt"
+        echo "  - OVNK CNI detected (Cluster1: ${CNI_CLUSTER1}, Cluster2: ${CNI_CLUSTER2})" >> "${OUTPUT_DIR}/verify/connectivity-skip-src-ip-check.txt"
+        echo "  - Testing if OVNK SNAT issue is the root cause" >> "${OUTPUT_DIR}/verify/connectivity-skip-src-ip-check.txt"
+        echo "" >> "${OUTPUT_DIR}/verify/connectivity-skip-src-ip-check.txt"
+
+        # Run verify with --skip-src-ip-check
+        (
+            KUBECONFIG="${MERGED_KUBECONFIG}" subctl verify \
+                --context "${CLUSTER1_NAME}" \
+                --tocontext "${CLUSTER2_NAME}" \
+                --only connectivity \
+                --connection-timeout 50 \
+                --verbose \
+                --skip-src-ip-check \
+                ${IMAGE_OVERRIDE} \
+                >> "${OUTPUT_DIR}/verify/connectivity-skip-src-ip-check.txt" 2>&1
+        ) &
+        VERIFY_PID=$!
+
+        # Wait with progress monitoring
+        elapsed=0
+        PROGRESS_INTERVAL=60
+        VERIFY_TIMEOUT=1800
+        while kill -0 $VERIFY_PID 2>/dev/null; do
+            if [ $elapsed -ge $VERIFY_TIMEOUT ]; then
+                echo "  ⚠ OVNK verify test exceeded ${VERIFY_TIMEOUT}s timeout - terminating"
+                kill $VERIFY_PID 2>/dev/null
+                echo "" >> "${OUTPUT_DIR}/verify/connectivity-skip-src-ip-check.txt"
+                echo "Verification terminated after ${VERIFY_TIMEOUT}s timeout" >> "${OUTPUT_DIR}/verify/connectivity-skip-src-ip-check.txt"
+                break
+            fi
+
+            sleep $PROGRESS_INTERVAL
+            elapsed=$((elapsed + PROGRESS_INTERVAL))
+            echo "  ... still running (${elapsed}s elapsed)"
+        done
+
+        wait $VERIFY_PID 2>/dev/null || echo "OVNK verify test failed or timed out" >> "${OUTPUT_DIR}/verify/connectivity-skip-src-ip-check.txt"
+        echo "  End time: $(date '+%Y-%m-%d %H:%M:%S')"
+    elif [ "$OVNK_DETECTED" = "true" ] && [ "$CONNECTIVITY_FAILED" = "false" ]; then
+        echo "  → Regular connectivity tests passed - no need for OVNK-specific test"
+    fi
+
     # Cleanup merged kubeconfig
     rm -f "${MERGED_KUBECONFIG}"
 fi
