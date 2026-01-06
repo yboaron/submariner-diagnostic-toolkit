@@ -113,9 +113,99 @@ class SubmarinerAnalyzer:
             return match.group(1).strip()
         return "unknown"
 
+    def check_version_compatibility(self):
+        """Check for version mismatches between subctl and Submariner"""
+        manifest_content = self.read_file("manifest.txt")
+        if not manifest_content:
+            return
+
+        # Extract version information from manifest
+        subctl_version = None
+        cluster1_version = None
+        cluster2_version = None
+        version_mismatch_detected = False
+        different_cluster_versions = False
+
+        for line in manifest_content.split('\n'):
+            if 'subctl version:' in line:
+                match = re.search(r'v([0-9]+\.[0-9]+)', line)
+                if match:
+                    subctl_version = match.group(1)
+            elif 'Cluster1 Submariner version:' in line:
+                match = re.search(r'release-([0-9]+\.[0-9]+)', line)
+                if match:
+                    cluster1_version = match.group(1)
+            elif 'Cluster2 Submariner version:' in line:
+                match = re.search(r'release-([0-9]+\.[0-9]+)', line)
+                if match:
+                    cluster2_version = match.group(1)
+            elif 'VERSION MISMATCH DETECTED!' in line:
+                version_mismatch_detected = True
+            elif 'Different Submariner versions between clusters' in line:
+                different_cluster_versions = True
+
+        # Display version information and warnings
+        if subctl_version or cluster1_version or cluster2_version:
+            print(f"\n{Colors.BOLD}=== Version Compatibility ==={Colors.ENDC}")
+            if subctl_version:
+                print(f"  subctl version: v{subctl_version}")
+            if cluster1_version:
+                print(f"  Cluster1 Submariner: release-{cluster1_version}")
+            if cluster2_version:
+                print(f"  Cluster2 Submariner: release-{cluster2_version}")
+
+            # Check for mismatches
+            if version_mismatch_detected:
+                self.faulty_states.append("Version mismatch: subctl and Submariner versions don't match")
+                print(f"\n  {Colors.FAIL}✗ VERSION MISMATCH DETECTED{Colors.ENDC}")
+
+                if subctl_version and cluster1_version and subctl_version != cluster1_version:
+                    print(f"    Cluster1: subctl v{subctl_version} vs Submariner release-{cluster1_version}")
+                    self.recommendations.append(f"Update subctl to version v{cluster1_version} to match Submariner deployment")
+
+                if subctl_version and cluster2_version and subctl_version != cluster2_version:
+                    print(f"    Cluster2: subctl v{subctl_version} vs Submariner release-{cluster2_version}")
+                    if not (subctl_version and cluster1_version and subctl_version != cluster1_version):
+                        self.recommendations.append(f"Update subctl to version v{cluster2_version} to match Submariner deployment")
+
+                self.recommendations.append("Version mismatches can cause unexpected behavior and test failures")
+
+                # Display prominent warning about incorrect results
+                print(f"\n  {Colors.FAIL}{'='*60}{Colors.ENDC}")
+                print(f"  {Colors.FAIL}WARNING: Version mismatch could lead to INCORRECT RESULTS{Colors.ENDC}")
+                print(f"  {Colors.FAIL}{'='*60}{Colors.ENDC}")
+                print(f"  {Colors.WARNING}The diagnostic analysis below may be misleading or inaccurate due to{Colors.ENDC}")
+                print(f"  {Colors.WARNING}incompatibility between subctl CLI and deployed Submariner components.{Colors.ENDC}")
+                print(f"  {Colors.WARNING}Recommend fixing version mismatch before trusting analysis results.{Colors.ENDC}")
+                print(f"  {Colors.FAIL}{'='*60}{Colors.ENDC}")
+
+            if different_cluster_versions:
+                self.faulty_states.append("Different Submariner versions between clusters")
+                print(f"\n  {Colors.WARNING}⚠ Different Submariner versions between clusters{Colors.ENDC}")
+                print(f"    Cluster1: release-{cluster1_version}")
+                print(f"    Cluster2: release-{cluster2_version}")
+                print(f"    This is NOT recommended and may cause compatibility issues")
+                self.recommendations.append("Update both clusters to use the same Submariner version")
+
+                # Display warning about potential issues
+                print(f"\n  {Colors.WARNING}{'='*60}{Colors.ENDC}")
+                print(f"  {Colors.WARNING}WARNING: Different cluster versions may cause issues{Colors.ENDC}")
+                print(f"  {Colors.WARNING}{'='*60}{Colors.ENDC}")
+                print(f"  {Colors.WARNING}Running different Submariner versions between clusters is NOT{Colors.ENDC}")
+                print(f"  {Colors.WARNING}recommended and may lead to tunnel negotiation or compatibility issues.{Colors.ENDC}")
+                print(f"  {Colors.WARNING}{'='*60}{Colors.ENDC}")
+
+            if not version_mismatch_detected and not different_cluster_versions:
+                if cluster1_version and cluster2_version and cluster1_version == cluster2_version:
+                    if subctl_version and subctl_version == cluster1_version:
+                        print(f"  {Colors.OKGREEN}✓ All versions compatible (v{subctl_version}){Colors.ENDC}")
+
     def check_faulty_states(self):
         """Check for faulty states before starting deep analysis"""
         print(f"\n{Colors.BOLD}=== Checking for Faulty States ==={Colors.ENDC}")
+
+        # Check version compatibility first
+        self.check_version_compatibility()
 
         # Check tunnel status
         cluster1_show = self.read_file("cluster1/subctl-show-all.txt")
@@ -215,7 +305,13 @@ class SubmarinerAnalyzer:
 
         # Check small packet tests (MTU testing)
         small_packet = self.read_file("verify/connectivity-small-packet.txt")
-        if small_packet and "SKIPPED" not in small_packet:
+        if small_packet and "SMALL PACKET TEST SKIPPED" in small_packet:
+            # Check why it was skipped
+            if "regular connectivity test passed" in small_packet.lower():
+                print(f"  {Colors.OKGREEN}✓{Colors.ENDC} Small packet verification: SKIPPED (regular test passed, no MTU issue)")
+            else:
+                print(f"  {Colors.WARNING}⚠{Colors.ENDC} Small packet verification: SKIPPED")
+        elif small_packet and "SKIPPED" not in small_packet:
             tests_found = True
             self.verify_tests_run = True
 
@@ -929,6 +1025,17 @@ class SubmarinerAnalyzer:
         print(f"\n{Colors.BOLD}{'='*60}{Colors.ENDC}")
         print(f"{Colors.BOLD}ANALYSIS SUMMARY{Colors.ENDC}")
         print(f"{Colors.BOLD}{'='*60}{Colors.ENDC}")
+
+        # Check for version issues and display prominent warning at top
+        has_version_mismatch = any("version mismatch" in fault.lower() for fault in self.faulty_states)
+        has_different_versions = any("different submariner versions" in fault.lower() for fault in self.faulty_states)
+
+        if has_version_mismatch:
+            print(f"\n{Colors.FAIL}╔{'═'*58}╗{Colors.ENDC}")
+            print(f"{Colors.FAIL}║  ⚠ WARNING: VERSION MISMATCH DETECTED                   ║{Colors.ENDC}")
+            print(f"{Colors.FAIL}║  Analysis results below may be INCORRECT or MISLEADING  ║{Colors.ENDC}")
+            print(f"{Colors.FAIL}╚{'═'*58}╝{Colors.ENDC}")
+            print(f"{Colors.WARNING}Recommend fixing version compatibility before trusting this analysis.{Colors.ENDC}\n")
 
         if not self.faulty_states and not self.issues:
             # Healthy state (only possible if verify tests weren't run or if they passed)

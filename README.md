@@ -40,15 +40,21 @@ pip install pyyaml
 ### 1. Collect Diagnostics
 
 ```bash
-./collect-full-diagnostics.sh <cluster1-name> <cluster1-kubeconfig> <cluster2-name> <cluster2-kubeconfig> <issue-description>
+./collect-full-diagnostics.sh <cluster1-name> <cluster1-kubeconfig> <cluster2-name> <cluster2-kubeconfig> [issue-description]
 ```
 
-**Example:**
+**Examples:**
 ```bash
+# With issue description
 ./collect-full-diagnostics.sh \
   cluster1 /path/to/kubeconfig1 \
   cluster2 /path/to/kubeconfig2 \
   "tunnel not connected"
+
+# Without issue description (defaults to "undefined")
+./collect-full-diagnostics.sh \
+  cluster1 /path/to/kubeconfig1 \
+  cluster2 /path/to/kubeconfig2
 ```
 
 **Output:** `submariner-diagnostics-TIMESTAMP.tar.gz`
@@ -60,6 +66,7 @@ pip install pyyaml
 ```
 
 **What it detects:**
+- Version compatibility issues (subctl vs Submariner)
 - Tunnel connectivity status
 - ESP/UDP protocol blocking
 - Firewall blocking (inter-cluster and intra-cluster)
@@ -124,9 +131,11 @@ cp analyze-offline.md ~/.claude/commands/submariner/analyze-offline.md
   - IPsec status and traffic counters
   - Network configuration (routes, iptables, XFRM policies)
 - `subctl show` - Connection status overview
+- `subctl show versions` - Component version information
 - `subctl diagnose` - Health check results
 - Gateway and RouteAgent status
 - ACM resources (if present)
+- Version compatibility check (in manifest.txt)
 
 ### Conditional Collection
 
@@ -170,6 +179,12 @@ cp analyze-offline.md ~/.claude/commands/submariner/analyze-offline.md
 - ✅ Validates context names are different
 - ✅ Checks for required tools (subctl, kubectl, tcpdump)
 - ✅ Validates parameters before starting collection
+- ✅ **Version compatibility check** - Verifies subctl and Submariner versions match
+  - Checks both clusters separately
+  - Warns if versions mismatch
+  - Warns if clusters have different Submariner versions
+  - Prompts user to continue or cancel if mismatch detected
+  - Documents all version info in manifest
 
 ### Smart Exit Behavior
 - Exits on validation failures (missing prereqs)
@@ -276,6 +291,7 @@ submariner-diagnostics-TIMESTAMP.tar.gz
     │   │       ├── submariner-gateway-*.log # Gateway logs
     │   │       └── pods_*.yaml              # Pod status
     │   ├── subctl-show-all.txt
+    │   ├── subctl-show-versions.txt  # Version information
     │   ├── subctl-diagnose-all.txt
     │   └── routeagents.yaml
     ├── cluster2/                     # Cluster 2 (same structure)
@@ -331,6 +347,14 @@ kubectl config get-contexts --kubeconfig /path/to/kubeconfig
 - Normal - waits 80 seconds for packet capture
 - Both clusters collected in parallel
 - Total tcpdump time: ~85-90 seconds
+
+**Version mismatch warning**
+- Collection script checks if subctl and Submariner versions match
+- If mismatch detected:
+  - Script shows warning with versions
+  - Prompts to continue or cancel
+  - Documents mismatch in manifest.txt
+- **Recommended:** Update subctl to match Submariner version
 
 ### Analysis Issues
 

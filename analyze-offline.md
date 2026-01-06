@@ -111,6 +111,11 @@ diagnostics-dir/
 - Extract timestamp
 - Extract complaint (if not provided by user)
 - Note which clusters were collected
+- **Extract version information:**
+  - subctl version
+  - Cluster1 Submariner version
+  - Cluster2 Submariner version
+  - Check for version mismatch warnings
 
 **Detect Deployment Type (CRITICAL):**
 
@@ -162,7 +167,8 @@ Based on the complaint, route to appropriate analysis:
 #### A. Always Read (for all complaints):
 1. `cluster1/subctl-show-all.txt` - Connection status overview
 2. `cluster2/subctl-show-all.txt` - Connection status overview (if exists)
-3. `manifest.txt` - Metadata
+3. `manifest.txt` - Metadata and version information
+4. Check for version compatibility issues in manifest.txt
 
 #### B. For Tunnel Issues - IPsec Control Plane:
 1. `cluster1/gather/cluster*/submariners_submariner-operator_submariner.yaml` - Gateway CR (authoritative source for tunnel status)
@@ -209,6 +215,11 @@ Note: The verify files contain the actual command executed at the top. Check if:
   - This indicates systemic connectivity issues (first 6 tests failed)
   - Failed test details are captured before the stop
   - Treat early-stopped tests as failed - they indicate connectivity problems
+- **Small packet test skip:** The small packet test may be skipped if regular test passed
+  - Look for: "SMALL PACKET TEST SKIPPED" with reason "regular connectivity test passed"
+  - This is NORMAL and GOOD - means no MTU issue (large packets already working)
+  - Small packet test is only useful when large packets fail (MTU detection)
+  - Don't report this as an issue or missing data
 
 #### G. For RouteAgent Issues:
 1. `cluster1/routeagents.yaml` - RouteAgent status
@@ -222,6 +233,67 @@ Note: The verify files contain the actual command executed at the top. Check if:
 ### Phase 5: Perform Analysis
 
 Apply the same logic as live troubleshooting commands, but read from files:
+
+#### **Analysis 0: Version Compatibility (ALWAYS CHECK FIRST)**
+
+**Check Version Information in manifest.txt**
+
+The manifest.txt file contains version information collected during diagnostic gathering:
+
+```
+Version Information:
+  subctl version: v0.21.0
+  Cluster1 Submariner version: release-0.21
+  Cluster2 Submariner version: release-0.21
+  ⚠ VERSION MISMATCH DETECTED!
+    Cluster1: subctl v0.20 vs Submariner release-0.21
+```
+
+**Look for these patterns:**
+
+1. **Version Mismatch Between subctl and Submariner:**
+   - Line contains: "⚠ VERSION MISMATCH DETECTED!"
+   - Shows: "Cluster1: subctl vX.Y vs Submariner release-X.Y"
+   - Shows: "Cluster2: subctl vX.Y vs Submariner release-X.Y"
+
+2. **Different Submariner Versions Between Clusters:**
+   - Line contains: "⚠ Different Submariner versions between clusters"
+   - Shows different release versions for cluster1 and cluster2
+
+**Analysis:**
+
+**If version mismatch detected:**
+→ This is a **configuration issue** that can cause:
+  - Unexpected behavior in subctl commands
+  - Test failures (especially `subctl verify`)
+  - Incompatibilities between CLI and deployed components
+  - Misleading diagnostic results
+
+**If clusters have different Submariner versions:**
+→ This is **NOT recommended** and may cause:
+  - Compatibility issues between clusters
+  - Tunnel negotiation problems
+  - Unexpected connectivity failures
+
+**Recommendation:**
+
+Include version compatibility in your findings and recommendations:
+
+**For subctl version mismatch:**
+- Recommend updating subctl to match Submariner version
+- Note that diagnostic results may be affected by version mismatch
+- Warn that test failures could be due to CLI/component incompatibility
+
+**For different cluster versions:**
+- Recommend updating both clusters to the same Submariner version
+- Note this as a potential root cause if tunnel issues exist
+
+**Important:**
+- **ALWAYS display a prominent warning** if version mismatch is detected
+- Version issues should be called out early in the analysis (at the top of the report)
+- Version mismatches can mask or cause other issues
+- Always check version compatibility before diagnosing other problems
+- The warning should be impossible to miss - use visual separators and clear language
 
 #### **Analysis 1: Tunnel Health**
 
@@ -464,6 +536,12 @@ Read:
 - `verify/connectivity.txt` - Default packet size (~3000 bytes)
 - `verify/connectivity-small-packet.txt` - Small packet size (400 bytes)
 
+**IMPORTANT:** Check if small packet test was skipped:
+- If file contains "SMALL PACKET TEST SKIPPED" and "regular connectivity test passed":
+  → This is NORMAL - regular test already passed, so no MTU issue exists
+  → Don't report this as missing data or an issue
+  → Skip MTU analysis entirely (no MTU problem if large packets work)
+
 **MTU Issue Pattern (DEFINITIVE):**
 - Default packet test FAILS (may have stopped early after 6 failures)
 - Small packet test SUCCEEDS
@@ -669,8 +747,25 @@ Provide a brief report following this template:
 **Issue:** <complaint from manifest>
 **Deployment:** <Standalone Submariner / ACM-Managed>
 
+---
+
+**CRITICAL: If version mismatch detected, display this warning first:**
+
+```
+⚠️  WARNING: VERSION MISMATCH DETECTED
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+The analysis results below may be INCORRECT or MISLEADING due to
+incompatibility between subctl CLI and deployed Submariner components.
+
+Recommend fixing version compatibility before trusting this analysis.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+---
+
 ### Key Findings
 
+✓/✗ **Version Compatibility** - subctl vs Submariner versions (manifest.txt)
 ✓/✗ **Finding 1** - Brief description with file reference
 ✓/✗ **Finding 2** - Brief description with file reference
 ✓/✗ **Finding 3** - Brief description with file reference
@@ -779,6 +874,20 @@ DIAGNOSTIC DATA:
   Deployment Type: <Standalone Submariner / ACM-Managed>
 
 ========================================
+VERSION COMPATIBILITY WARNING (if applicable)
+========================================
+
+**CRITICAL: If version mismatch detected, display this warning:**
+
+⚠️  WARNING: VERSION MISMATCH DETECTED
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+The analysis results below may be INCORRECT or MISLEADING due to
+incompatibility between subctl CLI and deployed Submariner components.
+
+Recommend fixing version compatibility before trusting this analysis.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+========================================
 EXECUTIVE SUMMARY
 ========================================
 
@@ -791,6 +900,25 @@ EXECUTIVE SUMMARY
 ========================================
 DETAILED FINDINGS
 ========================================
+
+0. VERSION COMPATIBILITY
+
+   subctl version: <version from manifest>
+   Cluster1 Submariner version: <version from manifest>
+   Cluster2 Submariner version: <version from manifest>
+
+   Version Mismatch Detected: <Yes/No>
+   Different Cluster Versions: <Yes/No>
+
+   Finding:
+   ✓/✗ Versions are compatible
+   ✗ subctl version mismatch with Submariner deployment (cluster1/cluster2)
+   ✗ Different Submariner versions between clusters (NOT recommended)
+
+   Impact:
+   - Version mismatches can cause unexpected behavior
+   - Test failures may be due to CLI/component incompatibility
+   - Diagnostic results may be misleading
 
 1. TUNNEL STATUS (Submariner Control Plane)
 
@@ -885,8 +1013,10 @@ DETAILED FINDINGS
 7. CONNECTIVITY VERIFICATION (if available)
 
    Default packet size: <PASS/FAIL>
-   Small packet size: <PASS/FAIL>
+   Small packet size: <PASS/FAIL/SKIPPED (regular test passed - no MTU issue)>
    Service discovery: <PASS/FAIL>
+
+   Note: Small packet test skipped when regular test passes (expected behavior)
 
 ========================================
 ROOT CAUSE ANALYSIS
@@ -1218,6 +1348,10 @@ Refer to Submariner documentation for updating these settings based on your depl
 FILES ANALYZED
 ========================================
 
+**Version Information:**
+- manifest.txt - Version compatibility (subctl vs Submariner)
+
+**Key Configuration and Status Files:**
 <List of key files that were examined with their purposes>
 
 ========================================
@@ -1337,6 +1471,8 @@ After providing the report, be ready to:
 
 1. User provides: `/submariner:analyze-offline submariner-diagnostics-20251229-152608.tar.gz`
 2. Read manifest.txt - complaint: "general health check"
+   - Check version information: subctl v0.21, Submariner release-0.21 (both clusters)
+   - Check for version mismatch warnings
 3. Read cluster1/subctl-show-all.txt - tunnel status = "connected" from cluster1 view
 4. Read cluster2/subctl-show-all.txt - tunnel status = "error" from cluster2 view
 5. Read Gateway CR - confirm asymmetric status, usingIP=private_ip, backend=libreswan

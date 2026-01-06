@@ -14,17 +14,18 @@ KUBECONFIG2="$4"
 COMPLAINT="$5"
 
 show_usage() {
-    echo "Usage: $0 <cluster1-name> <cluster1-kubeconfig> <cluster2-name> <cluster2-kubeconfig> <issue-description>"
+    echo "Usage: $0 <cluster1-name> <cluster1-kubeconfig> <cluster2-name> <cluster2-kubeconfig> [issue-description]"
     echo ""
     echo "Arguments:"
     echo "  cluster1-name        - Name/context for cluster 1 (required)"
     echo "  cluster1-kubeconfig  - Path to kubeconfig for cluster 1 (required)"
     echo "  cluster2-name        - Name/context for cluster 2 (required)"
     echo "  cluster2-kubeconfig  - Path to kubeconfig for cluster 2 (required)"
-    echo "  issue-description    - Description of the issue (required)"
+    echo "  issue-description    - Description of the issue (optional, defaults to 'undefined')"
     echo ""
-    echo "Example:"
+    echo "Examples:"
     echo "  $0 cluster1 /path/to/kubeconfig1 cluster2 /path/to/kubeconfig2 'tunnel not connected'"
+    echo "  $0 cluster1 /path/to/kubeconfig1 cluster2 /path/to/kubeconfig2"
     echo ""
     return 1 2>/dev/null || exit 1
 }
@@ -50,6 +51,10 @@ collect_cluster_diagnostics() {
     # subctl diagnose (health checks)
     echo "Running subctl diagnose for ${cluster_name}..."
     subctl diagnose all --kubeconfig "${kubeconfig}" > "${cluster_dir}/subctl-diagnose-all.txt" 2>&1
+
+    # subctl show versions (version information)
+    echo "Running subctl show versions for ${cluster_name}..."
+    subctl show versions --kubeconfig "${kubeconfig}" > "${cluster_dir}/subctl-show-versions.txt" 2>&1
 
     # Additional CRs that might not be in gather
     echo "Collecting additional CRs for ${cluster_name}..."
@@ -350,11 +355,52 @@ collect_firewall_intra_cluster() {
     fi
 }
 
-# Check if all 5 parameters are provided
-if [ $# -ne 5 ]; then
-    echo "ERROR: All 5 parameters are required"
+# Function to check and compare subctl and Submariner versions
+check_version_compatibility() {
+    local kubeconfig="$1"
+    local cluster_name="$2"
+
+    # Get Submariner version from cluster
+    local submariner_version=$(subctl show versions --kubeconfig="${kubeconfig}" 2>/dev/null | grep -E 'submariner-gateway|submariner-operator' | awk '{print $3}' | head -1 | grep -oP 'release-\K[0-9]+\.[0-9]+' | head -1)
+
+    if [ -z "$submariner_version" ]; then
+        echo "  ${cluster_name}: ⚠ Unable to detect Submariner version"
+        return 1
+    fi
+
+    echo "  ${cluster_name}: Submariner version: release-${submariner_version}"
+
+    # Store version for this cluster
+    if [ "$cluster_name" = "cluster1" ]; then
+        SUBMARINER_VER_C1="$submariner_version"
+    else
+        SUBMARINER_VER_C2="$submariner_version"
+    fi
+
+    # Compare with subctl version
+    if [ "$SUBCTL_VERSION_MAJOR_MINOR" != "$submariner_version" ]; then
+        echo "  ${cluster_name}: ⚠ VERSION MISMATCH!"
+        echo "    subctl version:      v${SUBCTL_VERSION_MAJOR_MINOR}"
+        echo "    Submariner version:  release-${submariner_version}"
+        return 1
+    else
+        echo "  ${cluster_name}: ✓ Versions compatible (v${SUBCTL_VERSION_MAJOR_MINOR})"
+        return 0
+    fi
+}
+
+# Check if at least 4 parameters are provided (issue-description is optional)
+if [ $# -lt 4 ]; then
+    echo "ERROR: At least 4 parameters are required (issue-description is optional)"
     echo ""
     show_usage
+    return 1 2>/dev/null || exit 1
+fi
+
+# Set issue-description to "undefined" if not provided
+if [ $# -eq 4 ]; then
+    echo "Note: Issue description not provided - using 'undefined'"
+    COMPLAINT="undefined"
 fi
 
 # Validate parameters before starting collection
@@ -438,6 +484,89 @@ fi
 echo "✓ All validations passed"
 echo ""
 
+# Check subctl and Submariner version compatibility
+echo "Checking version compatibility..."
+
+# Get subctl version
+SUBCTL_VERSION_FULL=$(subctl version 2>/dev/null | grep -oP 'subctl version: v\K[0-9]+\.[0-9]+\.[0-9]+')
+SUBCTL_VERSION_MAJOR_MINOR=$(echo "$SUBCTL_VERSION_FULL" | grep -oP '[0-9]+\.[0-9]+')
+
+if [ -z "$SUBCTL_VERSION_MAJOR_MINOR" ]; then
+    echo "⚠ WARNING: Unable to detect subctl version"
+    SUBCTL_VERSION_FULL="unknown"
+    SUBCTL_VERSION_MAJOR_MINOR="unknown"
+else
+    echo "subctl version: v${SUBCTL_VERSION_FULL}"
+fi
+
+# Initialize version variables
+SUBMARINER_VER_C1=""
+SUBMARINER_VER_C2=""
+VERSION_MISMATCH_C1=false
+VERSION_MISMATCH_C2=false
+
+# Check cluster1
+if [ "$SUBCTL_VERSION_MAJOR_MINOR" != "unknown" ]; then
+    if ! check_version_compatibility "${KUBECONFIG1}" "cluster1"; then
+        VERSION_MISMATCH_C1=true
+    fi
+fi
+
+# Check cluster2
+if [ "$SUBCTL_VERSION_MAJOR_MINOR" != "unknown" ]; then
+    if ! check_version_compatibility "${KUBECONFIG2}" "cluster2"; then
+        VERSION_MISMATCH_C2=true
+    fi
+fi
+
+# Check if clusters have different Submariner versions
+if [ -n "$SUBMARINER_VER_C1" ] && [ -n "$SUBMARINER_VER_C2" ] && [ "$SUBMARINER_VER_C1" != "$SUBMARINER_VER_C2" ]; then
+    echo ""
+    echo "⚠ WARNING: Different Submariner versions detected between clusters!"
+    echo "  Cluster1: release-${SUBMARINER_VER_C1}"
+    echo "  Cluster2: release-${SUBMARINER_VER_C2}"
+    echo "  This is NOT recommended and may cause compatibility issues."
+fi
+
+# Display warning if version mismatch detected
+if [ "$VERSION_MISMATCH_C1" = "true" ] || [ "$VERSION_MISMATCH_C2" = "true" ]; then
+    echo ""
+    echo "========================================"
+    echo "⚠ WARNING: VERSION MISMATCH DETECTED!"
+    echo "========================================"
+    echo ""
+    echo "subctl and Submariner versions should match for compatibility."
+    echo ""
+    if [ "$VERSION_MISMATCH_C1" = "true" ]; then
+        echo "Cluster1 mismatch:"
+        echo "  subctl:      v${SUBCTL_VERSION_MAJOR_MINOR}"
+        echo "  Submariner:  release-${SUBMARINER_VER_C1}"
+        echo ""
+    fi
+    if [ "$VERSION_MISMATCH_C2" = "true" ]; then
+        echo "Cluster2 mismatch:"
+        echo "  subctl:      v${SUBCTL_VERSION_MAJOR_MINOR}"
+        echo "  Submariner:  release-${SUBMARINER_VER_C2}"
+        echo ""
+    fi
+    echo "Recommended action:"
+    if [ -n "$SUBMARINER_VER_C1" ]; then
+        echo "  Update subctl to version v${SUBMARINER_VER_C1}"
+    elif [ -n "$SUBMARINER_VER_C2" ]; then
+        echo "  Update subctl to version v${SUBMARINER_VER_C2}"
+    fi
+    echo ""
+    echo -n "Continue anyway? (yes/no): "
+    read -r CONTINUE_ANSWER
+    if [ "$CONTINUE_ANSWER" != "yes" ] && [ "$CONTINUE_ANSWER" != "y" ]; then
+        echo "Collection cancelled by user."
+        return 1 2>/dev/null || exit 1
+    fi
+    echo ""
+fi
+
+echo ""
+
 mkdir -p "${OUTPUT_DIR}"
 
 COLLECTION_START_TIME=$(date +%s)
@@ -448,6 +577,33 @@ echo "========================================="
 echo ""
 echo "Timestamp: ${TIMESTAMP}" > "${OUTPUT_DIR}/manifest.txt"
 echo "Complaint: ${COMPLAINT}" >> "${OUTPUT_DIR}/manifest.txt"
+echo "" >> "${OUTPUT_DIR}/manifest.txt"
+
+# Add version information to manifest
+echo "Version Information:" >> "${OUTPUT_DIR}/manifest.txt"
+echo "  subctl version: v${SUBCTL_VERSION_FULL}" >> "${OUTPUT_DIR}/manifest.txt"
+if [ -n "$SUBMARINER_VER_C1" ]; then
+    echo "  Cluster1 Submariner version: release-${SUBMARINER_VER_C1}" >> "${OUTPUT_DIR}/manifest.txt"
+fi
+if [ -n "$SUBMARINER_VER_C2" ]; then
+    echo "  Cluster2 Submariner version: release-${SUBMARINER_VER_C2}" >> "${OUTPUT_DIR}/manifest.txt"
+fi
+
+# Document version mismatch warnings if any
+if [ "$VERSION_MISMATCH_C1" = "true" ] || [ "$VERSION_MISMATCH_C2" = "true" ]; then
+    echo "  ⚠ VERSION MISMATCH DETECTED!" >> "${OUTPUT_DIR}/manifest.txt"
+    if [ "$VERSION_MISMATCH_C1" = "true" ]; then
+        echo "    Cluster1: subctl v${SUBCTL_VERSION_MAJOR_MINOR} vs Submariner release-${SUBMARINER_VER_C1}" >> "${OUTPUT_DIR}/manifest.txt"
+    fi
+    if [ "$VERSION_MISMATCH_C2" = "true" ]; then
+        echo "    Cluster2: subctl v${SUBCTL_VERSION_MAJOR_MINOR} vs Submariner release-${SUBMARINER_VER_C2}" >> "${OUTPUT_DIR}/manifest.txt"
+    fi
+fi
+
+# Document if clusters have different Submariner versions
+if [ -n "$SUBMARINER_VER_C1" ] && [ -n "$SUBMARINER_VER_C2" ] && [ "$SUBMARINER_VER_C1" != "$SUBMARINER_VER_C2" ]; then
+    echo "  ⚠ Different Submariner versions between clusters (NOT recommended)" >> "${OUTPUT_DIR}/manifest.txt"
+fi
 echo "" >> "${OUTPUT_DIR}/manifest.txt"
 
 # Collect from Cluster 1
@@ -858,7 +1014,7 @@ if [ "$SKIP_VERIFY" = "false" ]; then
         # Check if we should stop early due to consistent failures
         # Count completed tests (each test ends with "• [X.XXX seconds]")
         if [ -f "${OUTPUT_DIR}/verify/connectivity.txt" ]; then
-            completed_tests=$(grep -c "\[.*seconds\]" "${OUTPUT_DIR}/verify/connectivity.txt" 2>/dev/null)
+            completed_tests=$(grep -c "\[.*seconds\]" "${OUTPUT_DIR}/verify/connectivity.txt" 2>/dev/null | tr -d '\n\r' || echo "0")
             # Ensure it's a valid number
             if ! [[ "$completed_tests" =~ ^[0-9]+$ ]]; then
                 completed_tests=0
@@ -897,6 +1053,36 @@ if [ "$SKIP_VERIFY" = "false" ]; then
 
     wait $VERIFY_PID 2>/dev/null || echo "Connectivity verification failed or timed out" >> "${OUTPUT_DIR}/verify/connectivity.txt"
     echo "  End time: $(date '+%Y-%m-%d %H:%M:%S')"
+
+    # Check if regular connectivity test passed
+    CONNECTIVITY_PASSED=false
+    if [ -f "${OUTPUT_DIR}/verify/connectivity.txt" ]; then
+        if grep -qE "SUCCESS!|[0-9]+\s+Passed.*0\s+Failed" "${OUTPUT_DIR}/verify/connectivity.txt" 2>/dev/null; then
+            CONNECTIVITY_PASSED=true
+        fi
+    fi
+
+    # Skip small packet test if regular test passed (no point - large packets already work)
+    if [ "$RUN_MTU_TEST" = "true" ] && [ "$CONNECTIVITY_PASSED" = "true" ]; then
+        echo ""
+        echo "Skipping small packet test - regular connectivity test already passed"
+        echo "  (Small packet test is only useful to detect MTU issues when large packets fail)"
+        echo ""
+
+        echo "========================================" > "${OUTPUT_DIR}/verify/connectivity-small-packet.txt"
+        echo "SMALL PACKET TEST SKIPPED" >> "${OUTPUT_DIR}/verify/connectivity-small-packet.txt"
+        echo "========================================" >> "${OUTPUT_DIR}/verify/connectivity-small-packet.txt"
+        echo "" >> "${OUTPUT_DIR}/verify/connectivity-small-packet.txt"
+        echo "Small packet test was skipped because regular connectivity test passed." >> "${OUTPUT_DIR}/verify/connectivity-small-packet.txt"
+        echo "" >> "${OUTPUT_DIR}/verify/connectivity-small-packet.txt"
+        echo "The small packet test (--packet-size 400) is only useful to detect MTU/fragmentation" >> "${OUTPUT_DIR}/verify/connectivity-small-packet.txt"
+        echo "issues where large packets fail but small packets succeed. Since large packets are" >> "${OUTPUT_DIR}/verify/connectivity-small-packet.txt"
+        echo "already working, there is no need to test small packets." >> "${OUTPUT_DIR}/verify/connectivity-small-packet.txt"
+        echo "" >> "${OUTPUT_DIR}/verify/connectivity-small-packet.txt"
+        echo "Regular connectivity test result: PASSED" >> "${OUTPUT_DIR}/verify/connectivity-small-packet.txt"
+
+        RUN_MTU_TEST=false
+    fi
 
     if [ "$RUN_MTU_TEST" = "true" ]; then
         echo ""
@@ -940,7 +1126,7 @@ if [ "$SKIP_VERIFY" = "false" ]; then
 
             # Check if we should stop early due to consistent failures
             if [ -f "${OUTPUT_DIR}/verify/connectivity-small-packet.txt" ]; then
-                completed_tests=$(grep -c "\[.*seconds\]" "${OUTPUT_DIR}/verify/connectivity-small-packet.txt" 2>/dev/null)
+                completed_tests=$(grep -c "\[.*seconds\]" "${OUTPUT_DIR}/verify/connectivity-small-packet.txt" 2>/dev/null | tr -d '\n\r' || echo "0")
                 # Ensure it's a valid number
                 if ! [[ "$completed_tests" =~ ^[0-9]+$ ]]; then
                     completed_tests=0
@@ -1038,7 +1224,7 @@ if [ "$SKIP_VERIFY" = "false" ]; then
 
             # Check if we should stop early due to consistent failures
             if [ -f "${OUTPUT_DIR}/verify/service-discovery.txt" ]; then
-                completed_tests=$(grep -c "\[.*seconds\]" "${OUTPUT_DIR}/verify/service-discovery.txt" 2>/dev/null)
+                completed_tests=$(grep -c "\[.*seconds\]" "${OUTPUT_DIR}/verify/service-discovery.txt" 2>/dev/null | tr -d '\n\r' || echo "0")
                 # Ensure it's a valid number
                 if ! [[ "$completed_tests" =~ ^[0-9]+$ ]]; then
                     completed_tests=0
@@ -1230,6 +1416,8 @@ else
     echo "  - Service discovery verification results"
     if [ "$RUN_MTU_TEST" = "true" ]; then
         echo "  - MTU testing (small packet size)"
+    elif [ "$CONNECTIVITY_PASSED" = "true" ]; then
+        echo "  - MTU testing: SKIPPED (regular connectivity test passed)"
     else
         echo "  - MTU testing: SKIPPED (tunnel connected on only one cluster)"
     fi
