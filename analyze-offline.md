@@ -497,6 +497,8 @@ Recommended MSS value: **1300** (accounts for encapsulation overhead in standard
 
 Adjust based on your network MTU if needed.
 
+📖 **Official Documentation:** [Customize TCP MSS Clamping](https://submariner.io/getting-started/architecture/gateway-engine/) - See "Customize TCP MSS Clamping" section
+
 **Important Notes:**
 - Health check pings use small ICMP packets, so if health checks fail, MTU is NOT the root cause
 - MTU issues only appear with large data transfers, not control plane
@@ -682,6 +684,8 @@ subctl verify --context cluster1 --tocontext cluster2 --only connectivity --verb
 ```
 
 Expected outcome: Default packet size tests (~3KB) that previously failed should now pass with MSS clamping enabled.
+
+📖 **Official Documentation:** [Customize TCP MSS Clamping](https://submariner.io/getting-started/architecture/gateway-engine/)
 
 ---
 
@@ -940,6 +944,8 @@ subctl verify --context cluster1 --tocontext cluster2 --only connectivity --verb
 ```
 
 Expected outcome: Default packet size tests (~3KB) that previously failed should now pass with MSS clamping enabled.
+
+📖 **Official Documentation:** [Customize TCP MSS Clamping](https://submariner.io/getting-started/architecture/gateway-engine/)
 
 ---
 

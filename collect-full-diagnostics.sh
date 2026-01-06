@@ -131,7 +131,36 @@ spec:
         - |
           echo "Starting tcpdump capture for ${capture_duration} seconds..."
           timeout ${capture_duration} tcpdump -pnni any ${CAPTURE_FILTER} -w /tmp/gateway-traffic.pcap 2>&1
-          echo "Capture complete. Waiting for file extraction..."
+          echo "Capture complete. Generating analysis..."
+
+          # Generate analysis text file inside the container
+          {
+            echo "========================================="
+            echo "TCPDUMP CAPTURE SUMMARY: ${cluster_name} Gateway"
+            echo "Node: ${GATEWAY_NODE}"
+            echo "Capture Filter: ${CAPTURE_FILTER}"
+            echo "Capture Duration: ${capture_duration} seconds"
+            echo "========================================="
+            echo ""
+
+            # Count total packets
+            TOTAL_PACKETS=\$(tcpdump -r /tmp/gateway-traffic.pcap -nn 2>/dev/null | wc -l)
+            echo "CAPTURE STATISTICS:"
+            echo "  Total packets captured: \${TOTAL_PACKETS}"
+            echo ""
+
+            # Show first 50 packets with details
+            echo "FIRST 50 PACKETS (detailed):"
+            tcpdump -r /tmp/gateway-traffic.pcap -nnv 2>/dev/null | head -50
+            echo ""
+
+            # Show unique source/destination pairs
+            echo "UNIQUE SOURCE -> DESTINATION PAIRS:"
+            tcpdump -r /tmp/gateway-traffic.pcap -nnq 2>/dev/null | awk '{print \$3, "->", \$5}' | sort | uniq -c | sort -rn
+
+          } > /tmp/gateway-analysis.txt 2>&1
+
+          echo "Analysis complete. Waiting for file extraction..."
           sleep 300
         securityContext:
           privileged: true
@@ -178,75 +207,36 @@ EOF
     sleep $((capture_duration + 5))
 
     # Extract pcap file
-    echo "  Extracting pcap file from ${cluster_name}..."
+    echo "  Extracting files from ${cluster_name}..."
     kubectl cp "submariner-operator/${TCPDUMP_POD}:/tmp/gateway-traffic.pcap" "${tcpdump_dir}/${cluster_name}-gateway-${GATEWAY_NODE}.pcap" --kubeconfig="${kubeconfig}" 2>/dev/null
 
+    # Extract analysis file
+    kubectl cp "submariner-operator/${TCPDUMP_POD}:/tmp/gateway-analysis.txt" "${tcpdump_dir}/${cluster_name}-gateway-${GATEWAY_NODE}-analysis.txt" --kubeconfig="${kubeconfig}" 2>/dev/null
+
+    # Check if files were extracted successfully
     if [ -f "${tcpdump_dir}/${cluster_name}-gateway-${GATEWAY_NODE}.pcap" ]; then
         PCAP_SIZE=$(stat -f%z "${tcpdump_dir}/${cluster_name}-gateway-${GATEWAY_NODE}.pcap" 2>/dev/null || stat -c%s "${tcpdump_dir}/${cluster_name}-gateway-${GATEWAY_NODE}.pcap" 2>/dev/null)
         if [ "$PCAP_SIZE" -gt 100 ]; then
             echo "  ✓ pcap file collected: ${cluster_name}-gateway-${GATEWAY_NODE}.pcap (${PCAP_SIZE} bytes)"
 
-            # Generate text summary for offline analysis
-            echo "  Generating text summary of captured traffic..."
-            PCAP_FILE="${tcpdump_dir}/${cluster_name}-gateway-${GATEWAY_NODE}.pcap"
-            SUMMARY_FILE="${tcpdump_dir}/${cluster_name}-gateway-${GATEWAY_NODE}-analysis.txt"
-
-            {
-                echo "========================================="
-                echo "TCPDUMP CAPTURE SUMMARY: ${cluster_name} Gateway"
-                echo "Node: ${GATEWAY_NODE}"
-                echo "Capture Filter: ${CAPTURE_FILTER}"
-                echo "Capture Duration: ${capture_duration} seconds"
-                echo "========================================="
-                echo ""
-
-                # Count total packets
-                TOTAL_PACKETS=$(tcpdump -r "$PCAP_FILE" -nn 2>/dev/null | wc -l)
-                echo "CAPTURE STATISTICS:"
-                echo "  Total packets captured: ${TOTAL_PACKETS}"
-                echo ""
-
-                # Show first 50 packets with details
-                echo "FIRST 50 PACKETS (detailed):"
-                tcpdump -r "$PCAP_FILE" -nnv 2>/dev/null | head -50
-                echo ""
-
-                # Show unique source/destination pairs
-                echo "UNIQUE SOURCE -> DESTINATION PAIRS:"
-                if [ "$CAPTURE_FILTER" = "proto 50" ]; then
-                    # ESP packets - show IP pairs
-                    tcpdump -r "$PCAP_FILE" -nnq 2>/dev/null | awk '{print $3, "->", $5}' | sort | uniq -c | sort -rn
-                else
-                    # UDP packets - show IP:port pairs
-                    tcpdump -r "$PCAP_FILE" -nnq 2>/dev/null | awk '{print $3, "->", $5}' | sort | uniq -c | sort -rn
-                fi
-
-            } > "$SUMMARY_FILE" 2>&1
-
-            echo "  ✓ Text summary created: ${cluster_name}-gateway-${GATEWAY_NODE}-analysis.txt"
+            if [ -f "${tcpdump_dir}/${cluster_name}-gateway-${GATEWAY_NODE}-analysis.txt" ]; then
+                echo "  ✓ Analysis file collected: ${cluster_name}-gateway-${GATEWAY_NODE}-analysis.txt"
+            else
+                echo "  ⚠ Analysis file not found (will be generated from pcap if needed)"
+            fi
         else
             echo "  ✗ pcap file is empty or too small (${PCAP_SIZE} bytes) - no traffic captured"
 
-            # Create summary file for no traffic case
-            SUMMARY_FILE="${tcpdump_dir}/${cluster_name}-gateway-${GATEWAY_NODE}-analysis.txt"
-            {
-                echo "========================================="
-                echo "TCPDUMP CAPTURE SUMMARY: ${cluster_name} Gateway"
-                echo "Node: ${GATEWAY_NODE}"
-                echo "========================================="
-                echo ""
-                echo "CAPTURE STATISTICS:"
-                echo "  Total packets captured: 0"
-                echo ""
-                echo "Capture filter: ${CAPTURE_FILTER}"
-                echo "Capture duration: ${capture_duration} seconds"
-                echo "File size: ${PCAP_SIZE} bytes (empty or too small)"
-            } > "$SUMMARY_FILE"
+            # Keep the analysis file even if pcap is empty (it will show 0 packets)
+            if [ -f "${tcpdump_dir}/${cluster_name}-gateway-${GATEWAY_NODE}-analysis.txt" ]; then
+                echo "  ✓ Analysis file collected (shows no traffic)"
+            fi
 
+            # Remove empty pcap file
             rm -f "${tcpdump_dir}/${cluster_name}-gateway-${GATEWAY_NODE}.pcap"
         fi
     else
-        echo "  ✗ Failed to extract pcap file from ${cluster_name}"
+        echo "  ✗ Failed to extract files from ${cluster_name}"
     fi
 
     # Cleanup
@@ -413,13 +403,18 @@ if [ "$TUNNEL_STATUS_CLUSTER1" != "connected" ] || [ "$TUNNEL_STATUS_CLUSTER2" !
 
     # Check if any pcap files were collected
     PCAP_COUNT=$(find "${OUTPUT_DIR}/tcpdump" -name "*.pcap" 2>/dev/null | wc -l)
-    if [ "$PCAP_COUNT" -eq 0 ]; then
-        echo "  ⚠ No pcap files were collected (no traffic detected)"
+    ANALYSIS_COUNT=$(find "${OUTPUT_DIR}/tcpdump" -name "*-analysis.txt" 2>/dev/null | wc -l)
+    if [ "$PCAP_COUNT" -eq 0 ] && [ "$ANALYSIS_COUNT" -eq 0 ]; then
+        echo "  ⚠ No files were collected (no traffic detected)"
         echo "  This may indicate that gateway pods are not sending ESP/UDP tunnel traffic."
         rmdir "${OUTPUT_DIR}/tcpdump" 2>/dev/null
     else
-        echo "  ✓ Collected ${PCAP_COUNT} pcap file(s)"
-        echo "  These files can be analyzed offline to determine where packets are being dropped."
+        if [ "$PCAP_COUNT" -gt 0 ]; then
+            echo "  ✓ Collected ${PCAP_COUNT} pcap file(s) and ${ANALYSIS_COUNT} analysis file(s)"
+        else
+            echo "  ✓ Collected ${ANALYSIS_COUNT} analysis file(s) (no traffic captured)"
+        fi
+        echo "  These files provide packet-level diagnostics for offline analysis."
     fi
 else
     echo "  ✓ Tunnel connected on both clusters - skipping tcpdump collection"

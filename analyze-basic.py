@@ -250,6 +250,7 @@ class SubmarinerAnalyzer:
             self.recommendations.insert(0, "Apply TCP MSS clamping: kubectl annotate node <gateway-node> submariner.io/tcp-clamp-mss=<mss-clamp-value>")
             self.recommendations.insert(1, "Restart routeagent pods to apply the changes: kubectl delete pod -n submariner-operator -l app=submariner-routeagent")
             self.recommendations.insert(2, "Recommended MSS value: 1300 (conservative value for most networks)")
+            self.recommendations.insert(3, "See official documentation: https://submariner.io/getting-started/architecture/gateway-engine/ (Customize TCP MSS Clamping)")
 
         # Check service discovery
         svc_discovery = self.read_file("verify/service-discovery.txt")

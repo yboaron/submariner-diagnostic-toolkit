@@ -243,8 +243,9 @@ submariner-diagnostics-TIMESTAMP.tar.gz
 - `bash`
 - `kubectl`
 - `subctl` - [Installation Guide](https://github.com/submariner-io/subctl)
-- `tcpdump` (for packet capture when tunnels are down)
 - Access to both Submariner clusters
+
+**Note:** Packet captures are performed inside the cluster using containers - no local `tcpdump` installation required.
 
 ### Basic Analysis
 - `python3` (3.6+)
