@@ -9,6 +9,7 @@ import os
 import tarfile
 import yaml
 import re
+import ipaddress
 from pathlib import Path
 from datetime import datetime
 
@@ -34,6 +35,8 @@ class SubmarinerAnalyzer:
         self.tunnel_status = {}  # Store tunnel status for later analysis
         self.verify_tests_run = False  # Track if verify tests were executed
         self.verify_tests_passed = False  # Track if verify tests passed
+        self.routeagent_data = {}  # Store RouteAgent analysis data
+        self.network_topology = {}  # Store network topology analysis
 
     def extract_tarball(self):
         """Extract tarball to temporary directory"""
@@ -922,6 +925,352 @@ class SubmarinerAnalyzer:
         else:
             print(f"  {Colors.OKGREEN}✓{Colors.ENDC} {cluster_name}: All pods healthy")
 
+    def get_gateway_status(self, cluster, actual_cluster_name):
+        """Get gateway-to-gateway connectivity status from Submariner CR"""
+        gather_dir = os.path.join(self.diagnostics_dir, cluster, "gather", actual_cluster_name)
+        if not os.path.exists(gather_dir):
+            return None
+
+        # Look for submariner CR YAML
+        for file in os.listdir(gather_dir):
+            if file.startswith("submariners_submariner-operator_submariner") and file.endswith(".yaml"):
+                submariner_cr = self.read_yaml(os.path.join(cluster, "gather", actual_cluster_name, file))
+                if submariner_cr:
+                    # Get gateway status from CR
+                    gateways = submariner_cr.get('status', {}).get('gateways', [])
+                    if gateways:
+                        # Look for active gateway
+                        for gw in gateways:
+                            if gw.get('haStatus') == 'active':
+                                connections = gw.get('connections', [])
+                                if connections:
+                                    # Return first connection status
+                                    return {
+                                        'status': connections[0].get('status', 'unknown'),
+                                        'gateway_node': gw.get('localEndpoint', {}).get('hostname', 'unknown'),
+                                        'remote_ip': connections[0].get('endpoint', {}).get('private_ip', 'unknown')
+                                    }
+        return None
+
+    def analyze_routeagents(self):
+        """Analyze RouteAgent resources to detect connectivity issues"""
+        print(f"\n{Colors.BOLD}=== Analyzing RouteAgent Resources ==={Colors.ENDC}")
+
+        # Get cluster subdirectory mapping
+        cluster_subdirs = self.get_cluster_subdirs()
+        if not cluster_subdirs:
+            print(f"  {Colors.WARNING}Could not determine cluster subdirectories{Colors.ENDC}")
+            return
+
+        for cluster in ['cluster1', 'cluster2']:
+            # Get the actual cluster name (e.g., sitea-mgmt1, siteb-mgmt1)
+            actual_cluster_name = cluster_subdirs.get(cluster)
+            if not actual_cluster_name:
+                print(f"  {cluster}: {Colors.WARNING}Could not determine cluster name{Colors.ENDC}")
+                continue
+
+            # Get gateway status first (gateway-to-gateway connectivity)
+            gateway_status = self.get_gateway_status(cluster, actual_cluster_name)
+
+            # Read RouteAgent CRs from gather subdirectory
+            gather_dir = os.path.join(self.diagnostics_dir, cluster, "gather", actual_cluster_name)
+            if not os.path.exists(gather_dir):
+                print(f"  {cluster}: {Colors.WARNING}No gather data for {actual_cluster_name}{Colors.ENDC}")
+                continue
+
+            # Collect all RouteAgent YAML files
+            agents = []
+            for file in os.listdir(gather_dir):
+                if file.startswith("routeagents_submariner-operator_") and file.endswith(".yaml"):
+                    agent_yaml = self.read_yaml(os.path.join(cluster, "gather", actual_cluster_name, file))
+                    if agent_yaml:
+                        agents.append(agent_yaml)
+
+            if not agents:
+                print(f"  {Colors.WARNING}⚠{Colors.ENDC} {cluster}: No RouteAgent resources")
+                continue
+
+            # Analyze each RouteAgent
+            error_agents = []
+            connected_agents = []
+            gateway_agents = []
+            pattern_detected = False
+            control_plane_failures = []
+
+            for agent in agents:
+                # Each agent is a single RouteAgent CR, not wrapped in items list
+                name = agent.get('metadata', {}).get('name', 'unknown')
+                status_obj = agent.get('status', {})
+                remote_endpoints = status_obj.get('remoteEndpoints', [])
+
+                if not remote_endpoints:
+                    continue
+
+                # Check first remote endpoint status
+                endpoint_status = remote_endpoints[0].get('status', '')
+                status_msg = remote_endpoints[0].get('statusMessage', '')
+
+                if endpoint_status == 'connected':
+                    connected_agents.append(name)
+                elif endpoint_status == 'none':
+                    # Gateway nodes don't perform health checks
+                    gateway_agents.append(name)
+                elif endpoint_status == 'error':
+                    error_agents.append((name, status_msg))
+
+                    # Detect if it's a control plane node by checking common naming patterns
+                    if any(pattern in name.lower() for pattern in ['cp-', 'control', 'master']):
+                        control_plane_failures.append((name, status_msg))
+
+            # Store data for later use
+            self.routeagent_data[cluster] = {
+                'total': len(agents),
+                'connected': len(connected_agents),
+                'errors': len(error_agents),
+                'gateways': len(gateway_agents)
+            }
+
+            # Report findings
+            print(f"  {cluster}: {len(agents)} RouteAgents found")
+            print(f"    Connected: {len(connected_agents)}")
+            print(f"    Gateway nodes: {len(gateway_agents)} (health check not performed)")
+
+            if error_agents:
+                print(f"    {Colors.FAIL}Errors: {len(error_agents)}{Colors.ENDC}")
+
+                # Check gateway-to-gateway connectivity status
+                if gateway_status:
+                    gw_status = gateway_status.get('status', 'unknown')
+                    gw_node = gateway_status.get('gateway_node', 'unknown')
+                    print(f"\n    Gateway-to-Gateway connectivity: {self.colorize_status(gw_status)}")
+                    print(f"    Gateway node: {gw_node}")
+
+                    # Correlate gateway status with RouteAgent failures
+                    if gw_status == 'connected' and error_agents:
+                        print(f"\n  {Colors.BOLD}🔍 ROOT CAUSE IDENTIFIED:{Colors.ENDC}")
+                        print(f"    ✓ Gateway → Remote Gateway: {Colors.OKGREEN}CONNECTED{Colors.ENDC}")
+                        print(f"    ✗ Non-gateway nodes → Remote Gateway: {Colors.FAIL}FAILED{Colors.ENDC}")
+                        print(f"\n    {Colors.WARNING}Diagnosis:{Colors.ENDC} This is an INTRA-cluster routing issue")
+                        print(f"    - Inter-cluster connectivity is working (gateway tunnel connected)")
+                        print(f"    - Problem: Non-gateway nodes cannot reach the remote gateway IP")
+                        print(f"    - This indicates the faulty segment is within the LOCAL cluster:")
+                        print(f"      Non-gateway nodes → Local gateway node's selected IP")
+
+                # Detect pattern: all control plane nodes failing
+                if control_plane_failures and len(control_plane_failures) >= 2:
+                    pattern_detected = True
+                    print(f"\n  {Colors.WARNING}⚠ PATTERN DETECTED:{Colors.ENDC} Multiple control plane nodes failing")
+
+                    for node_name, msg in control_plane_failures[:3]:  # Show first 3
+                        print(f"    - {node_name}")
+                        if "ping" in msg.lower():
+                            # Extract IP being pinged
+                            import re
+                            ip_match = re.search(r'(\d+\.\d+\.\d+\.\d+)', msg)
+                            if ip_match:
+                                failed_ip = ip_match.group(1)
+                                print(f"      Cannot ping: {failed_ip}")
+
+                    # Only add generic recommendations if we didn't already identify root cause
+                    if not gateway_status or gateway_status.get('status') != 'connected':
+                        self.faulty_states.append(f"{cluster}: Control plane nodes cannot reach remote gateway")
+                        self.recommendations.append(
+                            f"{cluster}: Check network connectivity from control plane to gateway nodes"
+                        )
+                        self.recommendations.append(
+                            f"{cluster}: Verify routing rules allow traffic from control planes to gateway IP"
+                        )
+                    else:
+                        self.faulty_states.append(f"{cluster}: Control planes cannot reach gateway IP (intra-cluster routing issue)")
+                        self.recommendations.append(
+                            f"{cluster}: INTRA-CLUSTER ISSUE - Verify control planes can reach local gateway node's IP"
+                        )
+                        self.recommendations.append(
+                            f"{cluster}: Check routing tables on control plane nodes to gateway subnet"
+                        )
+                        self.recommendations.append(
+                            f"{cluster}: Verify firewall rules allow control plane → gateway node traffic"
+                        )
+
+                # Show sample errors if pattern not detected
+                if not pattern_detected:
+                    for node_name, msg in error_agents[:2]:
+                        print(f"    - {node_name}: {msg[:80]}")
+                    if len(error_agents) > 2:
+                        print(f"    ... and {len(error_agents) - 2} more")
+
+                self.issues.append(f"{cluster}: {len(error_agents)} RouteAgent(s) with errors")
+
+    def get_cluster_subdirs(self):
+        """Get sorted list of cluster subdirectories from gather/
+
+        Since subctl gather collects from both clusters, we map:
+        - cluster1 -> first subdirectory alphabetically
+        - cluster2 -> second subdirectory alphabetically
+        """
+        # Check cluster1/gather for subdirectories
+        gather_dir = os.path.join(self.diagnostics_dir, "cluster1", "gather")
+        if not os.path.exists(gather_dir):
+            return {}
+
+        subdirs = sorted([d for d in os.listdir(gather_dir)
+                         if os.path.isdir(os.path.join(gather_dir, d))])
+
+        if len(subdirs) >= 2:
+            return {
+                'cluster1': subdirs[0],
+                'cluster2': subdirs[1]
+            }
+        elif len(subdirs) == 1:
+            # Only one subdirectory - use it for both
+            return {
+                'cluster1': subdirs[0],
+                'cluster2': subdirs[0]
+            }
+        return {}
+
+    def analyze_network_topology(self):
+        """Analyze network topology to detect flat vs non-flat networking
+
+        Only runs if RouteAgent errors were detected, as topology analysis
+        is only relevant when there are connectivity issues.
+        """
+        # Check if any RouteAgent errors were detected
+        has_errors = False
+        for cluster_data in self.routeagent_data.values():
+            if cluster_data.get('errors', 0) > 0:
+                has_errors = True
+                break
+
+        if not has_errors:
+            # Skip topology analysis if no RouteAgent errors
+            return
+
+        print(f"\n{Colors.BOLD}=== Analyzing Network Topology ==={Colors.ENDC}")
+        print(f"  (Running due to RouteAgent connectivity failures detected)")
+
+        # Get cluster subdirectory mapping
+        cluster_subdirs = self.get_cluster_subdirs()
+        if not cluster_subdirs:
+            print(f"  {Colors.WARNING}Could not determine cluster subdirectories{Colors.ENDC}")
+            return
+
+        for cluster in ['cluster1', 'cluster2']:
+            # Get the actual cluster name (e.g., sitea-mgmt1, siteb-mgmt1)
+            actual_cluster_name = cluster_subdirs.get(cluster)
+            if not actual_cluster_name:
+                print(f"  {cluster}: {Colors.WARNING}Could not determine cluster name{Colors.ENDC}")
+                continue
+
+            # Collect node IPs from pod YAML files (status.hostIP)
+            cluster_ips = set()
+            node_to_ip = {}
+
+            gather_dir = os.path.join(self.diagnostics_dir, cluster, "gather")
+            if not os.path.exists(gather_dir):
+                print(f"  {cluster}: {Colors.WARNING}No gather data found{Colors.ENDC}")
+                continue
+
+            # Only look in the subdirectory matching this cluster's name
+            cluster_gather_dir = os.path.join(gather_dir, actual_cluster_name)
+            if not os.path.exists(cluster_gather_dir):
+                print(f"  {cluster}: {Colors.WARNING}No gather data for {actual_cluster_name}{Colors.ENDC}")
+                continue
+
+            # Look for pod YAML files which contain hostIP information
+            for file in os.listdir(cluster_gather_dir):
+                if file.startswith("pods_") and file.endswith(".yaml"):
+                    pods_yaml = self.read_yaml(os.path.join(cluster, "gather", actual_cluster_name, file))
+                    if pods_yaml and isinstance(pods_yaml, dict):
+                        # Handle both single pod and list of pods
+                        pod_list = pods_yaml.get('items', [pods_yaml]) if 'items' in pods_yaml else [pods_yaml]
+
+                        for pod in pod_list:
+                            if not isinstance(pod, dict):
+                                continue
+
+                            # Get hostIP from pod status
+                            host_ip = pod.get('status', {}).get('hostIP')
+                            node_name = pod.get('spec', {}).get('nodeName')
+
+                            if host_ip:
+                                cluster_ips.add(host_ip)
+                                if node_name:
+                                    node_to_ip[node_name] = host_ip
+
+            if not cluster_ips:
+                print(f"  {cluster}: {Colors.WARNING}No node IP information found{Colors.ENDC}")
+                continue
+
+            # Auto-detect network topology by trying common subnet masks
+            # Try masks in order: /24 (most common), /22, /20, /16
+            common_masks = [24, 22, 20, 16]
+            topology_detected = False
+
+            for subnet_mask in common_masks:
+                ip_subnets = set()
+                subnet_to_ips = {}
+
+                for ip in cluster_ips:
+                    try:
+                        # Calculate network prefix based on subnet mask
+                        ip_obj = ipaddress.ip_address(ip)
+                        network = ipaddress.ip_network(f"{ip}/{subnet_mask}", strict=False)
+                        network_str = str(network)
+
+                        ip_subnets.add(network_str)
+                        if network_str not in subnet_to_ips:
+                            subnet_to_ips[network_str] = []
+                        subnet_to_ips[network_str].append(ip)
+                    except ValueError:
+                        # Skip invalid IPs
+                        continue
+
+                # Report findings if multiple subnets detected at this mask
+                if len(ip_subnets) > 1 and not topology_detected:
+                    topology_detected = True
+                    print(f"  {cluster}: {Colors.WARNING}Multiple subnets detected{Colors.ENDC}")
+                    print(f"    Node IPs span {len(ip_subnets)} different /{subnet_mask} subnets:")
+                    for subnet in sorted(ip_subnets):
+                        num_ips = len(subnet_to_ips[subnet])
+                        print(f"    - {subnet} ({num_ips} node{'s' if num_ips > 1 else ''})")
+
+                    print(f"\n    {Colors.BOLD}Note:{Colors.ENDC} This indicates non-flat networking (nodes in different /{subnet_mask} networks).")
+                    print(f"    Investigate network topology and routing between these subnets.")
+
+                    # Only add as issue if we also detected RouteAgent failures
+                    if self.routeagent_data.get(cluster, {}).get('errors', 0) > 0:
+                        self.issues.append(f"{cluster}: Multiple /{subnet_mask} subnets with RouteAgent connectivity errors")
+                        self.recommendations.append(
+                            f"{cluster}: Non-flat networking detected - verify routing between /{subnet_mask} subnets"
+                        )
+                        self.recommendations.append(
+                            f"{cluster}: Ensure nodes can route traffic between: {', '.join(sorted(ip_subnets))}"
+                        )
+
+                    self.network_topology[cluster] = {
+                        'total_ips': len(cluster_ips),
+                        'total_nodes': len(node_to_ip),
+                        'subnets': len(ip_subnets),
+                        'subnet_mask': subnet_mask,
+                        'is_flat': False
+                    }
+                    break
+
+            # If all masks show single subnet, it's flat networking
+            if not topology_detected:
+                print(f"  {cluster}: {Colors.OKGREEN}Flat networking detected{Colors.ENDC}")
+                # Show at /24 level for reference
+                network = ipaddress.ip_network(f"{list(cluster_ips)[0]}/24", strict=False)
+                print(f"    All node IPs within same network scope")
+
+                self.network_topology[cluster] = {
+                    'total_ips': len(cluster_ips),
+                    'total_nodes': len(node_to_ip),
+                    'subnets': 1,
+                    'is_flat': True
+                }
+
     def analyze_logs(self):
         """Analyze pod logs for errors and warnings"""
         print(f"\n{Colors.BOLD}=== Analyzing Pod Logs ==={Colors.ENDC}")
@@ -1129,7 +1478,13 @@ class SubmarinerAnalyzer:
         if has_faults:
             print(f"\n{Colors.BOLD}=== Starting Deep Analysis ==={Colors.ENDC}")
 
-            # Analyze logs for significant errors first
+            # Analyze RouteAgent resources first (key diagnostic info)
+            self.analyze_routeagents()
+
+            # Analyze network topology
+            self.analyze_network_topology()
+
+            # Analyze logs for significant errors
             self.analyze_logs()
 
             # Analyze tunnel details

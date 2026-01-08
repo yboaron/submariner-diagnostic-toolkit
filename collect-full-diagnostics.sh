@@ -7,25 +7,30 @@
 
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
 OUTPUT_DIR="submariner-diagnostics-${TIMESTAMP}"
-CLUSTER1_NAME="$1"
+CLUSTER1_CONTEXT="$1"
 KUBECONFIG1="$2"
-CLUSTER2_NAME="$3"
+CLUSTER2_CONTEXT="$3"
 KUBECONFIG2="$4"
 COMPLAINT="$5"
 
 show_usage() {
-    echo "Usage: $0 <cluster1-name> <cluster1-kubeconfig> <cluster2-name> <cluster2-kubeconfig> [issue-description]"
+    echo "Usage: $0 <cluster1-context> <cluster1-kubeconfig> <cluster2-context> <cluster2-kubeconfig> [issue-description]"
     echo ""
     echo "Arguments:"
-    echo "  cluster1-name        - Name/context for cluster 1 (required)"
+    echo "  cluster1-context     - Context name for cluster 1 (required)"
     echo "  cluster1-kubeconfig  - Path to kubeconfig for cluster 1 (required)"
-    echo "  cluster2-name        - Name/context for cluster 2 (required)"
+    echo "                         Can be same file as cluster2-kubeconfig if it contains both contexts"
+    echo "  cluster2-context     - Context name for cluster 2 (required)"
     echo "  cluster2-kubeconfig  - Path to kubeconfig for cluster 2 (required)"
+    echo "                         Can be same file as cluster1-kubeconfig if it contains both contexts"
     echo "  issue-description    - Description of the issue (optional, defaults to 'undefined')"
     echo ""
     echo "Examples:"
+    echo "  # Separate kubeconfig files:"
     echo "  $0 cluster1 /path/to/kubeconfig1 cluster2 /path/to/kubeconfig2 'tunnel not connected'"
-    echo "  $0 cluster1 /path/to/kubeconfig1 cluster2 /path/to/kubeconfig2"
+    echo ""
+    echo "  # Single kubeconfig with multiple contexts:"
+    echo "  $0 context1 /path/to/kubeconfig context2 /path/to/kubeconfig 'route agent degraded'"
     echo ""
     return 1 2>/dev/null || exit 1
 }
@@ -37,46 +42,47 @@ collect_cluster_diagnostics() {
     local context="$3"
     local cluster_dir="${OUTPUT_DIR}/${cluster_name}"
 
-    echo "=== Collecting from ${cluster_name} ==="
+    echo "=== Collecting from ${cluster_name} (context: ${context}) ==="
     mkdir -p "${cluster_dir}"
 
     # subctl gather (most comprehensive)
     echo "Running subctl gather for ${cluster_name}..."
-    subctl gather --kubeconfig "${kubeconfig}" --dir "${cluster_dir}/gather" 2>&1 | tee "${cluster_dir}/gather.log"
+    subctl gather --kubeconfig "${kubeconfig}" --context "${context}" --dir "${cluster_dir}/gather" 2>&1 | tee "${cluster_dir}/gather.log"
 
     # subctl show (connection status)
     echo "Running subctl show for ${cluster_name}..."
-    subctl show all --kubeconfig "${kubeconfig}" > "${cluster_dir}/subctl-show-all.txt" 2>&1
+    subctl show all --kubeconfig "${kubeconfig}" --context "${context}" > "${cluster_dir}/subctl-show-all.txt" 2>&1
 
     # subctl diagnose (health checks)
     echo "Running subctl diagnose for ${cluster_name}..."
-    subctl diagnose all --kubeconfig "${kubeconfig}" > "${cluster_dir}/subctl-diagnose-all.txt" 2>&1
+    subctl diagnose all --kubeconfig "${kubeconfig}" --context "${context}" > "${cluster_dir}/subctl-diagnose-all.txt" 2>&1
 
     # subctl show versions (version information)
     echo "Running subctl show versions for ${cluster_name}..."
-    subctl show versions --kubeconfig "${kubeconfig}" > "${cluster_dir}/subctl-show-versions.txt" 2>&1
+    subctl show versions --kubeconfig "${kubeconfig}" --context "${context}" > "${cluster_dir}/subctl-show-versions.txt" 2>&1
 
     # Additional CRs that might not be in gather
     echo "Collecting additional CRs for ${cluster_name}..."
-    kubectl get routeagents.submariner.io -n submariner-operator -o yaml --kubeconfig "${kubeconfig}" > "${cluster_dir}/routeagents.yaml" 2>&1 || echo "Failed to get RouteAgents" > "${cluster_dir}/routeagents.yaml"
+    kubectl get routeagents.submariner.io -n submariner-operator -o yaml --kubeconfig "${kubeconfig}" --context "${context}" > "${cluster_dir}/routeagents.yaml" 2>&1 || echo "Failed to get RouteAgents" > "${cluster_dir}/routeagents.yaml"
 
     # ACM resources (if ACM hub or managed cluster)
     echo "Checking for ACM resources on ${cluster_name}..."
-    kubectl get managedclusteraddon -A --kubeconfig "${kubeconfig}" 2>/dev/null | grep submariner > "${cluster_dir}/acm-addons.txt" || echo "No ACM ManagedClusterAddOn resources found" > "${cluster_dir}/acm-addons.txt"
-    kubectl get submarinerconfig -A -o yaml --kubeconfig "${kubeconfig}" > "${cluster_dir}/submarinerconfig.yaml" 2>&1 || echo "No SubmarinerConfig resources found" > "${cluster_dir}/submarinerconfig.yaml"
+    kubectl get managedclusteraddon -A --kubeconfig "${kubeconfig}" --context "${context}" 2>/dev/null | grep submariner > "${cluster_dir}/acm-addons.txt" || echo "No ACM ManagedClusterAddOn resources found" > "${cluster_dir}/acm-addons.txt"
+    kubectl get submarinerconfig -A -o yaml --kubeconfig "${kubeconfig}" --context "${context}" > "${cluster_dir}/submarinerconfig.yaml" 2>&1 || echo "No SubmarinerConfig resources found" > "${cluster_dir}/submarinerconfig.yaml"
 }
 
 # Function to collect tcpdump from gateway nodes
 collect_tcpdump_from_cluster() {
     local cluster_name="$1"
     local kubeconfig="$2"
-    local tcpdump_dir="$3"
-    local capture_duration="${4:-30}"
+    local context="$3"
+    local tcpdump_dir="$4"
+    local capture_duration="${5:-30}"
 
     echo "=== Collecting tcpdump from ${cluster_name} gateway nodes ==="
 
     # Get gateway node name
-    GATEWAY_NODE=$(kubectl get pods -n submariner-operator -l app=submariner-gateway --kubeconfig="${kubeconfig}" -o jsonpath='{.items[0].spec.nodeName}' 2>/dev/null)
+    GATEWAY_NODE=$(kubectl get pods -n submariner-operator -l app=submariner-gateway --kubeconfig="${kubeconfig}" --context="${context}" -o jsonpath='{.items[0].spec.nodeName}' 2>/dev/null)
 
     if [ -z "$GATEWAY_NODE" ]; then
         echo "  ✗ No gateway node found in ${cluster_name}, skipping tcpdump"
@@ -86,12 +92,12 @@ collect_tcpdump_from_cluster() {
     echo "  Gateway node: ${GATEWAY_NODE}"
 
     # Get Submariner configuration to determine capture filter
-    CABLE_DRIVER=$(kubectl get submariner submariner -n submariner-operator --kubeconfig="${kubeconfig}" -o jsonpath='{.spec.cableDriver}' 2>/dev/null)
+    CABLE_DRIVER=$(kubectl get submariner submariner -n submariner-operator --kubeconfig="${kubeconfig}" --context="${context}" -o jsonpath='{.spec.cableDriver}' 2>/dev/null)
     CABLE_DRIVER=${CABLE_DRIVER:-libreswan}  # Default to libreswan if not set
-    USING_IP=$(kubectl get submariner submariner -n submariner-operator --kubeconfig="${kubeconfig}" -o jsonpath='{.status.gateways[0].connections[0].usingIP}' 2>/dev/null)
-    PRIVATE_IP=$(kubectl get submariner submariner -n submariner-operator --kubeconfig="${kubeconfig}" -o jsonpath='{.status.gateways[0].connections[0].endpoint.private_ip}' 2>/dev/null)
-    FORCE_UDP=$(kubectl get submariner submariner -n submariner-operator --kubeconfig="${kubeconfig}" -o jsonpath='{.spec.ceIPSecForceUDPEncaps}' 2>/dev/null)
-    NATT_PORT=$(kubectl get submariner submariner -n submariner-operator --kubeconfig="${kubeconfig}" -o jsonpath='{.spec.ceIPSecNATTPort}' 2>/dev/null)
+    USING_IP=$(kubectl get submariner submariner -n submariner-operator --kubeconfig="${kubeconfig}" --context="${context}" -o jsonpath='{.status.gateways[0].connections[0].usingIP}' 2>/dev/null)
+    PRIVATE_IP=$(kubectl get submariner submariner -n submariner-operator --kubeconfig="${kubeconfig}" --context="${context}" -o jsonpath='{.status.gateways[0].connections[0].endpoint.private_ip}' 2>/dev/null)
+    FORCE_UDP=$(kubectl get submariner submariner -n submariner-operator --kubeconfig="${kubeconfig}" --context="${context}" -o jsonpath='{.spec.ceIPSecForceUDPEncaps}' 2>/dev/null)
+    NATT_PORT=$(kubectl get submariner submariner -n submariner-operator --kubeconfig="${kubeconfig}" --context="${context}" -o jsonpath='{.spec.ceIPSecNATTPort}' 2>/dev/null)
     NATT_PORT=${NATT_PORT:-4500}  # Default to 4500 if not set
 
     # Determine capture filter based on cable driver and configuration
@@ -107,7 +113,7 @@ collect_tcpdump_from_cluster() {
     fi
 
     # Create DaemonSet YAML for tcpdump
-    cat <<EOF | kubectl apply --kubeconfig="${kubeconfig}" -f - >/dev/null 2>&1
+    cat <<EOF | kubectl apply --kubeconfig="${kubeconfig}" --context="${context}" -f - >/dev/null 2>&1
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -195,13 +201,13 @@ EOF
     sleep 5
 
     # Wait for pod to be ready
-    kubectl wait --for=condition=Ready pod -l app=submariner-tcpdump-collector -n submariner-operator --kubeconfig="${kubeconfig}" --timeout=30s >/dev/null 2>&1
+    kubectl wait --for=condition=Ready pod -l app=submariner-tcpdump-collector -n submariner-operator --kubeconfig="${kubeconfig}" --context="${context}" --timeout=30s >/dev/null 2>&1
 
-    TCPDUMP_POD=$(kubectl get pods -n submariner-operator -l app=submariner-tcpdump-collector --kubeconfig="${kubeconfig}" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+    TCPDUMP_POD=$(kubectl get pods -n submariner-operator -l app=submariner-tcpdump-collector --kubeconfig="${kubeconfig}" --context="${context}" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
 
     if [ -z "$TCPDUMP_POD" ]; then
         echo "  ✗ tcpdump pod not found on ${cluster_name}"
-        kubectl delete daemonset submariner-tcpdump-collector -n submariner-operator --kubeconfig="${kubeconfig}" >/dev/null 2>&1
+        kubectl delete daemonset submariner-tcpdump-collector -n submariner-operator --kubeconfig="${kubeconfig}" --context="${context}" >/dev/null 2>&1
         return
     fi
 
@@ -213,10 +219,10 @@ EOF
 
     # Extract pcap file
     echo "  Extracting files from ${cluster_name}..."
-    kubectl cp "submariner-operator/${TCPDUMP_POD}:/tmp/gateway-traffic.pcap" "${tcpdump_dir}/${cluster_name}-gateway-${GATEWAY_NODE}.pcap" --kubeconfig="${kubeconfig}" 2>/dev/null
+    kubectl cp "submariner-operator/${TCPDUMP_POD}:/tmp/gateway-traffic.pcap" "${tcpdump_dir}/${cluster_name}-gateway-${GATEWAY_NODE}.pcap" --kubeconfig="${kubeconfig}" --context="${context}" 2>/dev/null
 
     # Extract analysis file
-    kubectl cp "submariner-operator/${TCPDUMP_POD}:/tmp/gateway-analysis.txt" "${tcpdump_dir}/${cluster_name}-gateway-${GATEWAY_NODE}-analysis.txt" --kubeconfig="${kubeconfig}" 2>/dev/null
+    kubectl cp "submariner-operator/${TCPDUMP_POD}:/tmp/gateway-analysis.txt" "${tcpdump_dir}/${cluster_name}-gateway-${GATEWAY_NODE}-analysis.txt" --kubeconfig="${kubeconfig}" --context="${context}" 2>/dev/null
 
     # Check if files were extracted successfully
     if [ -f "${tcpdump_dir}/${cluster_name}-gateway-${GATEWAY_NODE}.pcap" ]; then
@@ -246,7 +252,7 @@ EOF
 
     # Cleanup
     echo "  Cleaning up tcpdump DaemonSet from ${cluster_name}..."
-    kubectl delete daemonset submariner-tcpdump-collector -n submariner-operator --kubeconfig="${kubeconfig}" >/dev/null 2>&1
+    kubectl delete daemonset submariner-tcpdump-collector -n submariner-operator --kubeconfig="${kubeconfig}" --context="${context}" >/dev/null 2>&1
     echo "  ✓ Cleanup complete"
 }
 
@@ -312,14 +318,15 @@ collect_firewall_inter_cluster() {
 collect_firewall_intra_cluster() {
     local cluster_name="$1"
     local kubeconfig="$2"
-    local firewall_dir="$3"
-    local image_override="$4"
+    local context="$3"
+    local firewall_dir="$4"
+    local image_override="$5"
 
     echo "=== Collecting firewall intra-cluster diagnostics for ${cluster_name} ==="
     echo "  This tests firewall requirements for intra-cluster Submariner traffic"
 
     # Build command
-    FIREWALL_CMD="subctl diagnose firewall intra-cluster --kubeconfig ${kubeconfig} --verbose"
+    FIREWALL_CMD="subctl diagnose firewall intra-cluster --kubeconfig ${kubeconfig} --context ${context} --verbose"
     if [ -n "$image_override" ]; then
         FIREWALL_CMD="${FIREWALL_CMD} ${image_override}"
     fi
@@ -340,6 +347,7 @@ collect_firewall_intra_cluster() {
     # Run firewall test
     subctl diagnose firewall intra-cluster \
         --kubeconfig "${kubeconfig}" \
+        --context "${context}" \
         --verbose \
         ${image_override} \
         >> "${firewall_dir}/firewall-intra-cluster-${cluster_name}.txt" 2>&1
@@ -358,10 +366,11 @@ collect_firewall_intra_cluster() {
 # Function to check and compare subctl and Submariner versions
 check_version_compatibility() {
     local kubeconfig="$1"
-    local cluster_name="$2"
+    local context="$2"
+    local cluster_name="$3"
 
     # Get Submariner version from cluster
-    local submariner_version=$(subctl show versions --kubeconfig="${kubeconfig}" 2>/dev/null | grep -E 'submariner-gateway|submariner-operator' | awk '{print $3}' | head -1 | grep -oP 'release-\K[0-9]+\.[0-9]+' | head -1)
+    local submariner_version=$(subctl show versions --kubeconfig="${kubeconfig}" --context="${context}" 2>/dev/null | grep -E 'submariner-gateway|submariner-operator' | awk '{print $3}' | head -1 | grep -oP 'release-\K[0-9]+\.[0-9]+' | head -1)
 
     if [ -z "$submariner_version" ]; then
         echo "  ${cluster_name}: ⚠ Unable to detect Submariner version"
@@ -418,49 +427,53 @@ if [ ! -f "$KUBECONFIG2" ]; then
     return 1 2>/dev/null || exit 1
 fi
 
-# Validate cluster1 connectivity
-echo "Checking connectivity to cluster1..."
-if ! kubectl cluster-info --kubeconfig "$KUBECONFIG1" &>/dev/null; then
-    echo "ERROR: Cannot connect to cluster using kubeconfig: $KUBECONFIG1"
-    echo "Please verify:"
-    echo "  - The kubeconfig file is valid"
-    echo "  - The cluster is accessible from this machine"
-    echo "  - Your credentials are valid"
-    return 1 2>/dev/null || exit 1
-fi
-
-# Validate cluster2 connectivity
-echo "Checking connectivity to cluster2..."
-if ! kubectl cluster-info --kubeconfig "$KUBECONFIG2" &>/dev/null; then
-    echo "ERROR: Cannot connect to cluster using kubeconfig: $KUBECONFIG2"
-    echo "Please verify:"
-    echo "  - The kubeconfig file is valid"
-    echo "  - The cluster is accessible from this machine"
-    echo "  - Your credentials are valid"
-    return 1 2>/dev/null || exit 1
-fi
-
 # Validate context1 exists in kubeconfig1
-if ! kubectl config get-contexts "$CLUSTER1_NAME" --kubeconfig "$KUBECONFIG1" &>/dev/null; then
-    echo "ERROR: Context '$CLUSTER1_NAME' not found in kubeconfig: $KUBECONFIG1"
+echo "Checking context in cluster1 kubeconfig..."
+if ! kubectl config get-contexts "$CLUSTER1_CONTEXT" --kubeconfig "$KUBECONFIG1" &>/dev/null; then
+    echo "ERROR: Context '$CLUSTER1_CONTEXT' not found in kubeconfig: $KUBECONFIG1"
     echo "Available contexts:"
     kubectl config get-contexts --kubeconfig "$KUBECONFIG1" -o name
     return 1 2>/dev/null || exit 1
 fi
 
+# Validate cluster1 connectivity
+echo "Checking connectivity to cluster1..."
+if ! kubectl cluster-info --kubeconfig "$KUBECONFIG1" --context "$CLUSTER1_CONTEXT" &>/dev/null; then
+    echo "ERROR: Cannot connect to cluster using kubeconfig: $KUBECONFIG1, context: $CLUSTER1_CONTEXT"
+    echo "Please verify:"
+    echo "  - The kubeconfig file is valid"
+    echo "  - The context exists and is properly configured"
+    echo "  - The cluster is accessible from this machine"
+    echo "  - Your credentials are valid"
+    return 1 2>/dev/null || exit 1
+fi
+
 # Validate context2 exists in kubeconfig2
-if ! kubectl config get-contexts "$CLUSTER2_NAME" --kubeconfig "$KUBECONFIG2" &>/dev/null; then
-    echo "ERROR: Context '$CLUSTER2_NAME' not found in kubeconfig: $KUBECONFIG2"
+echo "Checking context in cluster2 kubeconfig..."
+if ! kubectl config get-contexts "$CLUSTER2_CONTEXT" --kubeconfig "$KUBECONFIG2" &>/dev/null; then
+    echo "ERROR: Context '$CLUSTER2_CONTEXT' not found in kubeconfig: $KUBECONFIG2"
     echo "Available contexts:"
     kubectl config get-contexts --kubeconfig "$KUBECONFIG2" -o name
     return 1 2>/dev/null || exit 1
 fi
 
+# Validate cluster2 connectivity
+echo "Checking connectivity to cluster2..."
+if ! kubectl cluster-info --kubeconfig "$KUBECONFIG2" --context "$CLUSTER2_CONTEXT" &>/dev/null; then
+    echo "ERROR: Cannot connect to cluster using kubeconfig: $KUBECONFIG2, context: $CLUSTER2_CONTEXT"
+    echo "Please verify:"
+    echo "  - The kubeconfig file is valid"
+    echo "  - The context exists and is properly configured"
+    echo "  - The cluster is accessible from this machine"
+    echo "  - Your credentials are valid"
+    return 1 2>/dev/null || exit 1
+fi
+
 # Validate contexts have different names
-if [ "$CLUSTER1_NAME" = "$CLUSTER2_NAME" ]; then
+if [ "$CLUSTER1_CONTEXT" = "$CLUSTER2_CONTEXT" ]; then
     echo "ERROR: Context names must be different for cluster1 and cluster2"
-    echo "  cluster1: $CLUSTER1_NAME"
-    echo "  cluster2: $CLUSTER2_NAME"
+    echo "  cluster1 context: $CLUSTER1_CONTEXT"
+    echo "  cluster2 context: $CLUSTER2_CONTEXT"
     echo ""
     echo "Using the same context for both clusters will cause 'subctl verify' to fail."
     echo "Please provide unique context names for each cluster."
@@ -507,14 +520,14 @@ VERSION_MISMATCH_C2=false
 
 # Check cluster1
 if [ "$SUBCTL_VERSION_MAJOR_MINOR" != "unknown" ]; then
-    if ! check_version_compatibility "${KUBECONFIG1}" "cluster1"; then
+    if ! check_version_compatibility "${KUBECONFIG1}" "${CLUSTER1_CONTEXT}" "cluster1"; then
         VERSION_MISMATCH_C1=true
     fi
 fi
 
 # Check cluster2
 if [ "$SUBCTL_VERSION_MAJOR_MINOR" != "unknown" ]; then
-    if ! check_version_compatibility "${KUBECONFIG2}" "cluster2"; then
+    if ! check_version_compatibility "${KUBECONFIG2}" "${CLUSTER2_CONTEXT}" "cluster2"; then
         VERSION_MISMATCH_C2=true
     fi
 fi
@@ -608,19 +621,19 @@ echo "" >> "${OUTPUT_DIR}/manifest.txt"
 
 # Collect from Cluster 1
 echo "Cluster 1:" >> "${OUTPUT_DIR}/manifest.txt"
-echo "  Name: ${CLUSTER1_NAME}" >> "${OUTPUT_DIR}/manifest.txt"
+echo "  Context: ${CLUSTER1_CONTEXT}" >> "${OUTPUT_DIR}/manifest.txt"
 echo "  Kubeconfig: ${KUBECONFIG1}" >> "${OUTPUT_DIR}/manifest.txt"
 echo "" >> "${OUTPUT_DIR}/manifest.txt"
 
-collect_cluster_diagnostics "cluster1" "${KUBECONFIG1}" "${CLUSTER1_NAME}"
+collect_cluster_diagnostics "cluster1" "${KUBECONFIG1}" "${CLUSTER1_CONTEXT}"
 
 # Collect from Cluster 2
 echo "Cluster 2:" >> "${OUTPUT_DIR}/manifest.txt"
-echo "  Name: ${CLUSTER2_NAME}" >> "${OUTPUT_DIR}/manifest.txt"
+echo "  Context: ${CLUSTER2_CONTEXT}" >> "${OUTPUT_DIR}/manifest.txt"
 echo "  Kubeconfig: ${KUBECONFIG2}" >> "${OUTPUT_DIR}/manifest.txt"
 echo "" >> "${OUTPUT_DIR}/manifest.txt"
 
-collect_cluster_diagnostics "cluster2" "${KUBECONFIG2}" "${CLUSTER2_NAME}"
+collect_cluster_diagnostics "cluster2" "${KUBECONFIG2}" "${CLUSTER2_CONTEXT}"
 
 # Check tunnel status and collect tcpdump if tunnel is not connected
 echo ""
@@ -648,10 +661,10 @@ if [ "$TUNNEL_STATUS_CLUSTER1" != "connected" ] || [ "$TUNNEL_STATUS_CLUSTER2" !
     echo "" >> "${OUTPUT_DIR}/manifest.txt"
 
     # Collect from both clusters in parallel (background processes)
-    collect_tcpdump_from_cluster "cluster1" "${KUBECONFIG1}" "${OUTPUT_DIR}/tcpdump" 80 &
+    collect_tcpdump_from_cluster "cluster1" "${KUBECONFIG1}" "${CLUSTER1_CONTEXT}" "${OUTPUT_DIR}/tcpdump" 80 &
     PID1=$!
 
-    collect_tcpdump_from_cluster "cluster2" "${KUBECONFIG2}" "${OUTPUT_DIR}/tcpdump" 80 &
+    collect_tcpdump_from_cluster "cluster2" "${KUBECONFIG2}" "${CLUSTER2_CONTEXT}" "${OUTPUT_DIR}/tcpdump" 80 &
     PID2=$!
 
     # Wait for both to complete
@@ -701,12 +714,12 @@ if [ "$TUNNEL_STATUS_CLUSTER1" != "connected" ] || [ "$TUNNEL_STATUS_CLUSTER2" !
     echo "  Reason: At least one tunnel is not in connected state"
 
     # Get cable driver and encapsulation info from cluster1
-    CABLE_DRIVER_C1=$(kubectl get submariner submariner -n submariner-operator --kubeconfig="${KUBECONFIG1}" -o jsonpath='{.spec.cableDriver}' 2>/dev/null)
+    CABLE_DRIVER_C1=$(kubectl get submariner submariner -n submariner-operator --kubeconfig="${KUBECONFIG1}" --context="${CLUSTER1_CONTEXT}" -o jsonpath='{.spec.cableDriver}' 2>/dev/null)
     CABLE_DRIVER_C1=${CABLE_DRIVER_C1:-libreswan}
-    USING_IP_C1=$(kubectl get submariner submariner -n submariner-operator --kubeconfig="${KUBECONFIG1}" -o jsonpath='{.status.gateways[0].connections[0].usingIP}' 2>/dev/null)
-    PRIVATE_IP_C1=$(kubectl get submariner submariner -n submariner-operator --kubeconfig="${KUBECONFIG1}" -o jsonpath='{.status.gateways[0].connections[0].endpoint.private_ip}' 2>/dev/null)
-    FORCE_UDP_C1=$(kubectl get submariner submariner -n submariner-operator --kubeconfig="${KUBECONFIG1}" -o jsonpath='{.spec.ceIPSecForceUDPEncaps}' 2>/dev/null)
-    NATT_PORT_C1=$(kubectl get submariner submariner -n submariner-operator --kubeconfig="${KUBECONFIG1}" -o jsonpath='{.spec.ceIPSecNATTPort}' 2>/dev/null)
+    USING_IP_C1=$(kubectl get submariner submariner -n submariner-operator --kubeconfig="${KUBECONFIG1}" --context="${CLUSTER1_CONTEXT}" -o jsonpath='{.status.gateways[0].connections[0].usingIP}' 2>/dev/null)
+    PRIVATE_IP_C1=$(kubectl get submariner submariner -n submariner-operator --kubeconfig="${KUBECONFIG1}" --context="${CLUSTER1_CONTEXT}" -o jsonpath='{.status.gateways[0].connections[0].endpoint.private_ip}' 2>/dev/null)
+    FORCE_UDP_C1=$(kubectl get submariner submariner -n submariner-operator --kubeconfig="${KUBECONFIG1}" --context="${CLUSTER1_CONTEXT}" -o jsonpath='{.spec.ceIPSecForceUDPEncaps}' 2>/dev/null)
+    NATT_PORT_C1=$(kubectl get submariner submariner -n submariner-operator --kubeconfig="${KUBECONFIG1}" --context="${CLUSTER1_CONTEXT}" -o jsonpath='{.spec.ceIPSecNATTPort}' 2>/dev/null)
     NATT_PORT_C1=${NATT_PORT_C1:-4500}  # Default to 4500 if not set
 
     # Determine if using UDP encapsulation
@@ -751,13 +764,13 @@ if [ "$RUN_FIREWALL_INTER_CLUSTER" = "true" ]; then
         # Quick registry check (simplified version)
         echo "Checking image registry accessibility..."
         RH_REGISTRY_OK=true
-        kubectl run fw-registry-check --image=registry.redhat.io/rhacm2/nettest:0.21.0 --restart=Never --kubeconfig="${KUBECONFIG1}" --command -- sleep 1 >/dev/null 2>&1
+        kubectl run fw-registry-check --image=registry.redhat.io/rhacm2/nettest:0.21.0 --restart=Never --kubeconfig="${KUBECONFIG1}" --context="${CLUSTER1_CONTEXT}" --command -- sleep 1 >/dev/null 2>&1
         sleep 2
-        POD_STATUS=$(kubectl get pod fw-registry-check --kubeconfig="${KUBECONFIG1}" -o jsonpath='{.status.containerStatuses[0].state}' 2>/dev/null)
+        POD_STATUS=$(kubectl get pod fw-registry-check --kubeconfig="${KUBECONFIG1}" --context="${CLUSTER1_CONTEXT}" -o jsonpath='{.status.containerStatuses[0].state}' 2>/dev/null)
         if ! echo "$POD_STATUS" | grep -qE "running|terminated|waiting.*PodInitializing|waiting.*ContainerCreating"; then
             RH_REGISTRY_OK=false
         fi
-        kubectl delete pod fw-registry-check --kubeconfig="${KUBECONFIG1}" --wait=false >/dev/null 2>&1
+        kubectl delete pod fw-registry-check --kubeconfig="${KUBECONFIG1}" --context="${CLUSTER1_CONTEXT}" --wait=false >/dev/null 2>&1
 
         if [ "$RH_REGISTRY_OK" = "false" ]; then
             FIREWALL_IMAGE_OVERRIDE="--image-override submariner-nettest=quay.io/submariner/nettest:devel"
@@ -768,7 +781,7 @@ if [ "$RUN_FIREWALL_INTER_CLUSTER" = "true" ]; then
         FIREWALL_IMAGE_OVERRIDE="$IMAGE_OVERRIDE"
     fi
 
-    collect_firewall_inter_cluster "${CLUSTER1_NAME}" "${KUBECONFIG1}" "${CLUSTER2_NAME}" "${KUBECONFIG2}" "${OUTPUT_DIR}/firewall" "${FIREWALL_IMAGE_OVERRIDE}"
+    collect_firewall_inter_cluster "${CLUSTER1_CONTEXT}" "${KUBECONFIG1}" "${CLUSTER2_CONTEXT}" "${KUBECONFIG2}" "${OUTPUT_DIR}/firewall" "${FIREWALL_IMAGE_OVERRIDE}"
 else
     echo "" >> "${OUTPUT_DIR}/manifest.txt"
     echo "Firewall Inter-Cluster Diagnostics: Skipped (requirements not met)" >> "${OUTPUT_DIR}/manifest.txt"
@@ -824,13 +837,13 @@ if [ "$RUN_FIREWALL_INTRA_CLUSTER1" = "true" ] || [ "$RUN_FIREWALL_INTRA_CLUSTER
         # Quick registry check if not done already
         echo "Checking image registry accessibility..."
         RH_REGISTRY_OK=true
-        kubectl run fw-intra-registry-check --image=registry.redhat.io/rhacm2/nettest:0.21.0 --restart=Never --kubeconfig="${KUBECONFIG1}" --command -- sleep 1 >/dev/null 2>&1
+        kubectl run fw-intra-registry-check --image=registry.redhat.io/rhacm2/nettest:0.21.0 --restart=Never --kubeconfig="${KUBECONFIG1}" --context="${CLUSTER1_CONTEXT}" --command -- sleep 1 >/dev/null 2>&1
         sleep 2
-        POD_STATUS=$(kubectl get pod fw-intra-registry-check --kubeconfig="${KUBECONFIG1}" -o jsonpath='{.status.containerStatuses[0].state}' 2>/dev/null)
+        POD_STATUS=$(kubectl get pod fw-intra-registry-check --kubeconfig="${KUBECONFIG1}" --context="${CLUSTER1_CONTEXT}" -o jsonpath='{.status.containerStatuses[0].state}' 2>/dev/null)
         if ! echo "$POD_STATUS" | grep -qE "running|terminated|waiting.*PodInitializing|waiting.*ContainerCreating"; then
             RH_REGISTRY_OK=false
         fi
-        kubectl delete pod fw-intra-registry-check --kubeconfig="${KUBECONFIG1}" --wait=false >/dev/null 2>&1
+        kubectl delete pod fw-intra-registry-check --kubeconfig="${KUBECONFIG1}" --context="${CLUSTER1_CONTEXT}" --wait=false >/dev/null 2>&1
 
         if [ "$RH_REGISTRY_OK" = "false" ]; then
             FIREWALL_IMAGE_OVERRIDE="--image-override submariner-nettest=quay.io/submariner/nettest:devel"
@@ -847,7 +860,7 @@ if [ "$RUN_FIREWALL_INTRA_CLUSTER1" = "true" ]; then
     echo "  Reason: CNI is ${CNI_CLUSTER1} (not OVNK)" >> "${OUTPUT_DIR}/manifest.txt"
     echo "" >> "${OUTPUT_DIR}/manifest.txt"
 
-    collect_firewall_intra_cluster "cluster1" "${KUBECONFIG1}" "${OUTPUT_DIR}/firewall" "${FIREWALL_IMAGE_OVERRIDE}"
+    collect_firewall_intra_cluster "cluster1" "${KUBECONFIG1}" "${CLUSTER1_CONTEXT}" "${OUTPUT_DIR}/firewall" "${FIREWALL_IMAGE_OVERRIDE}"
 fi
 
 # Run intra-cluster firewall diagnostics for cluster2 (independent of cluster1)
@@ -857,7 +870,7 @@ if [ "$RUN_FIREWALL_INTRA_CLUSTER2" = "true" ]; then
     echo "  Reason: CNI is ${CNI_CLUSTER2} (not OVNK)" >> "${OUTPUT_DIR}/manifest.txt"
     echo "" >> "${OUTPUT_DIR}/manifest.txt"
 
-    collect_firewall_intra_cluster "cluster2" "${KUBECONFIG2}" "${OUTPUT_DIR}/firewall" "${FIREWALL_IMAGE_OVERRIDE}"
+    collect_firewall_intra_cluster "cluster2" "${KUBECONFIG2}" "${CLUSTER2_CONTEXT}" "${OUTPUT_DIR}/firewall" "${FIREWALL_IMAGE_OVERRIDE}"
 fi
 
 # Run connectivity verification
@@ -1180,8 +1193,8 @@ if [ "$SKIP_VERIFY" = "false" ]; then
     # Check if service discovery is enabled before running the test
     echo ""
     echo "Checking if service discovery is enabled..."
-    SD_ENABLED_CLUSTER1=$(kubectl get submariner submariner -n submariner-operator --kubeconfig "${KUBECONFIG1}" -o jsonpath='{.spec.serviceDiscoveryEnabled}' 2>/dev/null)
-    SD_ENABLED_CLUSTER2=$(kubectl get submariner submariner -n submariner-operator --kubeconfig "${KUBECONFIG2}" -o jsonpath='{.spec.serviceDiscoveryEnabled}' 2>/dev/null)
+    SD_ENABLED_CLUSTER1=$(kubectl get submariner submariner -n submariner-operator --kubeconfig "${KUBECONFIG1}" --context "${CLUSTER1_CONTEXT}" -o jsonpath='{.spec.serviceDiscoveryEnabled}' 2>/dev/null)
+    SD_ENABLED_CLUSTER2=$(kubectl get submariner submariner -n submariner-operator --kubeconfig "${KUBECONFIG2}" --context "${CLUSTER2_CONTEXT}" -o jsonpath='{.spec.serviceDiscoveryEnabled}' 2>/dev/null)
 
     if [ "$SD_ENABLED_CLUSTER1" = "true" ] || [ "$SD_ENABLED_CLUSTER2" = "true" ]; then
         echo ""

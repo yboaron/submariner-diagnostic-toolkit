@@ -627,28 +627,108 @@ Using `--skip-src-ip-check` is NOT recommended for production as it bypasses sec
   - OVNK CNI was detected during collection
 - If this file doesn't exist, OVNK SNAT is not the issue
 
-#### **Analysis 3: RouteAgent Health**
+#### **Analysis 3: RouteAgent Health (Enhanced)**
 
-**Read RouteAgent CR:**
+**IMPORTANT: This analysis correlates RouteAgent status with gateway-to-gateway connectivity to identify intra-cluster vs inter-cluster issues.**
+
+**Read RouteAgent CRs (individual per-node files):**
 ```
-cluster*/routeagents.yaml
+cluster*/gather/<cluster-name>/routeagents_submariner-operator_<nodename>.yaml
 ```
 
-**Check each RouteAgent's `status.remoteEndpoints[].status` field:**
+**Note:** RouteAgent CRs are now collected as individual files per node in the gather subdirectory (e.g., `cluster1/gather/prod-east/routeagents_submariner-operator_worker-01.prod-east.yaml`), not as a single `routeagents.yaml` file. Make sure to read from the correct cluster subdirectory.
 
-**Rules:**
-- **Gateway nodes:** `status: none` = OK (expected - gateway doesn't check itself)
-- **Non-gateway nodes:** `status: connected` = OK (can route through gateway)
-- **Non-gateway nodes:** `status != connected` = Problem (local routing issue)
+**Also Read Gateway CR for correlation:**
+```
+cluster*/gather/<cluster-name>/submariners_submariner-operator_submariner.yaml
+```
 
-**Important Distinction:**
-- If tunnel status is "error" on gateway AND non-gateway nodes also show errors:
-  → Focus on gateway-to-gateway issue FIRST
-  → Non-gateway errors are likely downstream effect of tunnel failure
-  → Don't conclude "local routing issue" when gateway tunnel is broken
+**Step 1: Check Gateway-to-Gateway Connectivity**
 
-- If tunnel status is "connected" on gateway BUT non-gateway nodes show errors:
-  → This IS a local routing issue (nodes can't route through their gateway)
+From the Submariner CR, check `status.gateways[]`:
+- Find the gateway with `haStatus: active`
+- Check `connections[].status`
+- Record the gateway node hostname
+
+**Step 2: Check Each RouteAgent's Status**
+
+For each RouteAgent CR, check `status.remoteEndpoints[].status`:
+
+**Status Values:**
+- `none` = Gateway node (doesn't perform health checks on itself) - **EXPECTED**
+- `connected` = Non-gateway node successfully pinging remote gateway - **HEALTHY**
+- `error` = Non-gateway node failed to ping remote gateway - **PROBLEM**
+
+**Step 3: Correlate Gateway and RouteAgent Status**
+
+**Pattern A: Gateway Connected + RouteAgents Have Errors**
+```
+Gateway → Remote Gateway: connected ✓
+Non-gateway nodes → Remote Gateway: error ✗
+```
+
+**Diagnosis: INTRA-CLUSTER ROUTING ISSUE**
+- Inter-cluster connectivity is WORKING (gateway tunnel connected)
+- Problem: Non-gateway nodes cannot reach the remote gateway IP
+- **Root cause location:** Within the LOCAL cluster
+- **Faulty segment:** Non-gateway nodes → Local gateway node's selected IP
+
+**Pattern B: Gateway Error + RouteAgents Have Errors**
+```
+Gateway → Remote Gateway: error ✗
+Non-gateway nodes → Remote Gateway: error ✗
+```
+
+**Diagnosis: INTER-CLUSTER CONNECTIVITY ISSUE**
+- Inter-cluster connectivity is BROKEN (gateway tunnel not connected)
+- Non-gateway errors are a **downstream effect** of tunnel failure
+- **Root cause location:** Between clusters (firewall, routing, etc.)
+- **Faulty segment:** Gateway node ↔ Remote gateway node
+
+**DO NOT misdiagnose:** If the gateway tunnel is broken, focus on gateway-to-gateway issues FIRST. Don't conclude "local routing issue" when the gateway tunnel itself is broken.
+
+**Step 4: Detect Common Patterns**
+
+**Control Plane Failure Pattern:**
+If multiple control plane nodes (identified by names containing `cp-`, `control`, or `master`) are failing while worker nodes are connected:
+- **Pattern:** Non-flat network topology issue
+- **Cause:** Control plane nodes likely in different subnet than gateway node
+- **Issue:** Control planes cannot reach the gateway node's selected IP address
+- **See:** Network Topology Analysis below for subnet distribution
+
+**Step 5: Check Network Topology (Conditional)**
+
+**ONLY perform network topology analysis if RouteAgent errors were detected.**
+
+If Pattern A detected (gateway connected + RouteAgent errors), analyze node IP distribution:
+
+**Read pod host IPs from:**
+```
+cluster*/gather/<cluster-name>/pods_submariner-operator_*.yaml
+```
+
+**Extract `status.hostIP` from each pod** to get node IP addresses.
+
+**Analyze subnet distribution:**
+- Group IPs by /24 subnet (first 3 octets)
+- Count nodes per subnet
+- If nodes span multiple /24 subnets: **Potential non-flat networking**
+
+**Report Format:**
+```
+Node IPs observed across X different /24 subnets:
+- 10.100.10.0/24 (3 nodes)
+- 10.100.20.0/24 (6 nodes)
+
+Note: This indicates potential non-flat networking.
+Recommend investigating network topology and routing configuration.
+```
+
+**IMPORTANT Notes:**
+- This only shows ONE IP per node (the primary IP from pod hostIP)
+- Nodes may have additional network interfaces not visible in this data
+- Don't assume this is the complete network picture
+- Use this as a **starting point for investigation**, not a definitive diagnosis
 
 #### **Analysis 4: Pod Health**
 
