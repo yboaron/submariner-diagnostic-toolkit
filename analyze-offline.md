@@ -411,6 +411,34 @@ Search for ERROR, WARN, or FAIL messages. Key patterns:
 - Look for errors related to route installation, iptables, or IPsec configuration
 - If no configuration errors exist, the issue is likely infrastructure-level
 
+**Step 7a: Check for Libreswan Version Incompatibility (CRITICAL BUG)**
+
+Search gateway logs for libreswan/whack errors:
+
+```bash
+grep -i "unrecognized option\|whack.*error.*exit status 33" gateway.log
+```
+
+**Key Patterns:**
+- `unrecognized option '--encapsulation=yes'` - Libreswan whack does not recognize flag
+- `error exit status 33 whacking with args` - Libreswan command line parsing failed
+- Repeated tunnel establishment failures with these errors
+
+**If found:**
+→ This is a **Submariner software bug** - version incompatibility between Submariner code and libreswan binary
+→ Tunnel establishment will fail completely - no IPsec tunnels created
+→ This CANNOT be fixed by configuration changes
+
+**Analysis:**
+1. Check `connections: []` in Gateway CR (empty array indicates no tunnels established)
+2. Check tcpdump shows 0 packets (no tunnel traffic)
+3. Correlate with repeated whack errors in logs
+
+**Recommendation:**
+→ **Report to Submariner community** - this is a software bug that needs expert attention
+→ Share diagnostic tarball with Submariner Slack or GitHub
+→ Include version information (subctl version, Submariner release, libreswan version)
+
 **Special Case - OpenShift on OpenStack:**
 
 If BOTH conditions are met:
@@ -1204,7 +1232,48 @@ Expected outcome: Default packet size tests (~3KB) that previously failed should
 
 ---
 
-**For Other Issues (NOT MTU) - Step 1: Verify Submariner Prerequisites (FIRST PRIORITY)**
+**For Other Issues (NOT MTU) - Step 0: Check for Submariner Software Bugs (CRITICAL - CHECK FIRST)**
+
+**Before attempting any workarounds**, check if the issue is a Submariner software bug that requires expert attention.
+
+**Key Indicators of Software Bugs:**
+
+1. **Libreswan version incompatibility:**
+   - Gateway logs show: `unrecognized option '--encapsulation=yes'`
+   - Gateway CR shows: `connections: []` (empty array)
+   - tcpdump shows: 0 packets on both clusters
+   - Repeated whack errors with exit status 33
+
+2. **Other component failures:**
+   - Repeated crashes or initialization failures in pod logs
+   - Error messages about missing dependencies or incompatible versions
+   - Submariner components unable to start
+
+**If software bug detected:**
+
+→ **This CANNOT be fixed by configuration changes or workarounds**
+→ **Report to Submariner community immediately:**
+
+**Submariner Slack Channel:**
+- https://kubernetes.slack.com/archives/C010RJV694M
+- Share the diagnostic tarball
+- Mention the specific error pattern found
+
+**GitHub Issue:**
+- https://github.com/submariner-io/submariner/issues
+- Title: Describe the bug (e.g., "Libreswan whack doesn't recognize --encapsulation=yes in release-0.22")
+- Attach diagnostic tarball
+- Include version information from manifest.txt
+
+**Red Hat Support (if using RHACM):**
+- Open support case with diagnostic tarball
+- Reference the specific component error
+
+**Do NOT proceed with workarounds below** - they will not fix software bugs.
+
+---
+
+**For Other Issues (NOT MTU, NOT Software Bugs) - Step 1: Verify Submariner Prerequisites**
 
 Before applying any workarounds, verify that the infrastructure meets Submariner's network requirements.
 
@@ -1230,7 +1299,14 @@ Before applying any workarounds, verify that the infrastructure meets Submariner
 
 **Step 2: Enable UDP Encapsulation (WORKAROUND if ESP is blocked)**
 
-**What it does:** Forces IPsec payload to be encapsulated inside UDP packets (port 4500), **regardless of whether NAT was detected**. Even when Submariner NAT discovery selects private IP addresses (meaning no NAT is present), setting `ceIPSecForceUDPEncaps: true` will still use UDP encapsulation instead of native ESP.
+**What it does:** Forces IPsec payload to be encapsulated inside UDP packets (port 4500), **regardless of whether NAT was detected**.
+
+**How Submariner NAT Discovery Works:**
+- Submariner ALWAYS runs NAT discovery process automatically
+- If NAT is detected (gateway reachable only via public IP), UDP encapsulation is used automatically
+- If no NAT detected (gateway reachable via private IP), ESP (protocol 50) is used by default
+- The `ceIPSecForceUDPEncaps` flag forces UDP encapsulation even when no NAT detected
+- The `natEnabled` field is ONLY used if NAT discovery process times out
 
 **Why it's a workaround:** Doesn't fix the infrastructure blocking of ESP protocol - works around it by forcing UDP transport. This helps when:
 - ESP (IP protocol 50) is blocked by firewall/network infrastructure
@@ -1239,6 +1315,8 @@ Before applying any workarounds, verify that the infrastructure meets Submariner
 **Security Impact:** ✓ Maintains encryption - IPsec payload is still encrypted, just transported over UDP instead of ESP
 
 **How to apply:**
+
+**IMPORTANT:** For ACM-managed deployments, configuration changes must be made to **SubmarinerConfig CR on the ACM hub cluster**, NOT the Submariner CR on managed clusters. ACM will override any direct changes to Submariner CR.
 
 **For Standalone Submariner:**
 ```bash
@@ -1251,12 +1329,14 @@ kubectl delete pods -n submariner-operator -l app=submariner-gateway
 
 **For ACM-Managed Submariner:**
 ```bash
-# On the ACM hub cluster
+# CRITICAL: Apply changes on the ACM hub cluster, NOT on managed clusters
+# On the ACM hub cluster:
 kubectl patch submarinerconfig -n <managed-cluster-namespace> <submarinerconfig-name> \
   --type merge \
   -p '{"spec": {"ceIPSecForceUDPEncaps": true}}'
 
-# ACM will propagate changes automatically to managed clusters
+# ACM addon will propagate changes automatically to managed clusters
+# Do NOT edit Submariner CR directly - ACM will override it
 ```
 
 **Verify the fix:**
@@ -1289,6 +1369,8 @@ Only use this if:
 
 **How to apply:**
 
+**IMPORTANT:** For ACM-managed deployments, configuration changes must be made to **SubmarinerConfig CR on the ACM hub cluster**, NOT the Submariner CR on managed clusters.
+
 **For Standalone Submariner:**
 ```bash
 kubectl patch submariner -n submariner-operator submariner \
@@ -1301,12 +1383,14 @@ kubectl delete pods -n submariner-operator -l app=submariner-routeagent
 
 **For ACM-Managed Submariner:**
 ```bash
-# On the ACM hub cluster
+# CRITICAL: Apply changes on the ACM hub cluster, NOT on managed clusters
+# On the ACM hub cluster:
 kubectl patch submarinerconfig -n <managed-cluster-namespace> <submarinerconfig-name> \
   --type merge \
   -p '{"spec": {"cableDriver": "vxlan"}}'
 
-# ACM will propagate changes automatically
+# ACM addon will propagate changes automatically to managed clusters
+# Do NOT edit Submariner CR directly - ACM will override it
 ```
 
 **Verify the fix:**

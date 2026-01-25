@@ -80,6 +80,7 @@ pip install pyyaml
 
 **What it detects:**
 - Version compatibility issues (subctl vs Submariner)
+- **Submariner software bugs (e.g., libreswan version incompatibility)**
 - Tunnel connectivity status
 - ESP/UDP protocol blocking
 - Firewall blocking (inter-cluster and intra-cluster)
@@ -132,15 +133,17 @@ cp analyze-offline.md ~/.claude/commands/submariner/analyze-offline.md
 
 **What it detects (in addition to basic analysis):**
 - **MTU/fragmentation issues** (classic pattern: small packets pass, large packets fail)
+- **Submariner software bugs** requiring expert attention (e.g., libreswan incompatibility)
 - Infrastructure-level blocking patterns from tcpdump analysis
 - All issues detected by basic analysis
 
 **What it provides:**
 - Deep root cause analysis with context
 - Probabilistic reasoning ("most likely", "appears to be")
-- Step-by-step solutions with deployment-specific commands
+- Step-by-step solutions with deployment-specific commands (ACM vs Standalone)
 - Official documentation references
 - Further investigation steps if initial solution fails
+- Guidance on contacting Submariner experts for software bugs
 
 ## What Gets Collected
 

@@ -1320,6 +1320,9 @@ class SubmarinerAnalyzer:
 
         # Significant error patterns to look for
         significant_patterns = [
+            (r'unrecognized option.*--encapsulation', 'Libreswan version incompatibility - whack does not recognize --encapsulation flag'),
+            (r'whack:.*unrecognized option', 'Libreswan whack command failed - unknown option'),
+            (r'error exit status 33.*whack', 'Libreswan whack error - command line parsing failed'),
             (r'CREATE_CHILD_SA failed', 'IPsec tunnel negotiation failed'),
             (r'TS_UNACCEPTABLE', 'Traffic selector negotiation failed'),
             (r'IKE.*failed', 'IKE negotiation failed'),
@@ -1346,6 +1349,10 @@ class SubmarinerAnalyzer:
         # Report significant errors (limit to first 3 to avoid spam)
         if errors:
             print(f"  {Colors.FAIL}⚠{Colors.ENDC} {cluster_name}/{component}: Found significant errors in logs:")
+
+            # Check for libreswan version incompatibility
+            libreswan_errors = [e for e in errors if 'libreswan' in e[0].lower() or 'whack' in e[0].lower()]
+
             for i, (description, line) in enumerate(errors[:3]):
                 # Truncate very long lines
                 if len(line) > 120:
@@ -1356,9 +1363,18 @@ class SubmarinerAnalyzer:
                 print(f"    ... and {len(errors) - 3} more errors")
 
             self.issues.append(f"{cluster_name}/{component}: Found {len(errors)} significant error(s) in logs")
-            self.recommendations.append(
-                f"{cluster_name}/{component}: Review pod logs for detailed error messages"
-            )
+
+            # Provide specific guidance for libreswan errors
+            if libreswan_errors:
+                self.issues.append(f"{cluster_name}/{component}: Libreswan version compatibility issue detected")
+                self.recommendations.insert(0, f"{Colors.FAIL}CRITICAL:{Colors.ENDC} {cluster_name} - Libreswan version incompatibility - this is a Submariner software bug")
+                self.recommendations.insert(1, "Contact Submariner experts - Slack: https://kubernetes.slack.com/archives/C010RJV694M")
+                self.recommendations.insert(2, "Open GitHub issue: https://github.com/submariner-io/submariner/issues")
+                self.recommendations.insert(3, "Provide diagnostic tarball and mention libreswan version incompatibility with --encapsulation flag")
+            else:
+                self.recommendations.append(
+                    f"{cluster_name}/{component}: Review pod logs for detailed error messages"
+                )
 
     def colorize_status(self, status):
         """Add color to status based on value"""
