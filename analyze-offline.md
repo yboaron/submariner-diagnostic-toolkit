@@ -1,6 +1,5 @@
 ---
 description: Analyze Submariner diagnostics offline from collected data
-args: <diagnostics-path> [complaint]
 ---
 
 # Submariner Offline Analysis
@@ -111,11 +110,6 @@ diagnostics-dir/
 - Extract timestamp
 - Extract complaint (if not provided by user)
 - Note which clusters were collected
-- **Extract version information:**
-  - subctl version
-  - Cluster1 Submariner version
-  - Cluster2 Submariner version
-  - Check for version mismatch warnings
 
 **Detect Deployment Type (CRITICAL):**
 
@@ -167,8 +161,7 @@ Based on the complaint, route to appropriate analysis:
 #### A. Always Read (for all complaints):
 1. `cluster1/subctl-show-all.txt` - Connection status overview
 2. `cluster2/subctl-show-all.txt` - Connection status overview (if exists)
-3. `manifest.txt` - Metadata and version information
-4. Check for version compatibility issues in manifest.txt
+3. `manifest.txt` - Metadata
 
 #### B. For Tunnel Issues - IPsec Control Plane:
 1. `cluster1/gather/cluster*/submariners_submariner-operator_submariner.yaml` - Gateway CR (authoritative source for tunnel status)
@@ -196,6 +189,26 @@ Based on the complaint, route to appropriate analysis:
 3. `cluster1/gather/cluster*/submariner-routeagent-*-submariner-routeagent.log` - RouteAgent logs (check for errors)
 4. `cluster2/gather/cluster*/submariner-routeagent-*-submariner-routeagent.log` - RouteAgent logs (check for errors)
 
+#### D2. For Load Balancer / Hosted Cluster Issues:
+1. `cluster1/gather/cluster*/submariners_submariner-operator_submariner.yaml` - Check for `hostedCluster: true` and `loadBalancerEnabled: true`
+2. `cluster1/gather/cluster*/services_submariner-operator_submariner-gateway.yaml` - Load balancer service configuration
+3. `cluster2/gather/cluster*/services_submariner-operator_submariner-gateway.yaml` - Load balancer service configuration
+
+**Critical checks for load balancer service:**
+- Verify `spec.type: LoadBalancer`
+- Verify UDP ports exposed: 4490 (natt-discovery), 4500 (cable-encaps), 500 (IKE - if present)
+- Check `status.loadBalancer.ingress[].ip` - Is LB IP assigned?
+- **For hosted clusters:** Verify `spec.externalTrafficPolicy: Cluster` (REQUIRED for hosted clusters)
+  - Reference: https://github.com/submariner-io/submariner-operator/commit/f14c74e0c8180a64e7f38a7a82afeedd45940147
+  - If set to `Local`, this will cause connectivity failures in hosted cluster deployments
+- Check if load balancer IP is from expected IpAddressPools (KubeVirt environments)
+
+**Common issues:**
+- Load balancer IP assigned but not reachable (infrastructure issue)
+- Wrong `externalTrafficPolicy` for hosted clusters (`Local` instead of `Cluster`)
+- Load balancer not forwarding UDP traffic properly
+- IKE negotiation stuck at STATE_V2_PARENT_I1 (no response from remote gateway)
+
 #### E. For Pod Health Issues:
 1. `cluster1/gather/cluster*/pods_*.yaml` - Pod status
 2. `cluster1/gather/cluster*/*-submariner-*.log` - Pod logs
@@ -203,8 +216,7 @@ Based on the complaint, route to appropriate analysis:
 #### F. For Connectivity Issues:
 1. `verify/connectivity.txt` - Default packet size results
 2. `verify/connectivity-small-packet.txt` - Small packet size results (for MTU issues)
-3. `verify/connectivity-skip-src-ip-check.txt` - OVNK SNAT workaround test (if exists - only generated when OVNK detected and connectivity failed)
-4. Gateway CR and logs (same as tunnel issues)
+3. Gateway CR and logs (same as tunnel issues)
 
 Note: The verify files contain the actual command executed at the top. Check if:
 - The same context was used for both --context and --tocontext (common mistake)
@@ -215,11 +227,6 @@ Note: The verify files contain the actual command executed at the top. Check if:
   - This indicates systemic connectivity issues (first 6 tests failed)
   - Failed test details are captured before the stop
   - Treat early-stopped tests as failed - they indicate connectivity problems
-- **Small packet test skip:** The small packet test may be skipped if regular test passed
-  - Look for: "SMALL PACKET TEST SKIPPED" with reason "regular connectivity test passed"
-  - This is NORMAL and GOOD - means no MTU issue (large packets already working)
-  - Small packet test is only useful when large packets fail (MTU detection)
-  - Don't report this as an issue or missing data
 
 #### G. For RouteAgent Issues:
 1. `cluster1/routeagents.yaml` - RouteAgent status
@@ -233,67 +240,6 @@ Note: The verify files contain the actual command executed at the top. Check if:
 ### Phase 5: Perform Analysis
 
 Apply the same logic as live troubleshooting commands, but read from files:
-
-#### **Analysis 0: Version Compatibility (ALWAYS CHECK FIRST)**
-
-**Check Version Information in manifest.txt**
-
-The manifest.txt file contains version information collected during diagnostic gathering:
-
-```
-Version Information:
-  subctl version: v0.21.0
-  Cluster1 Submariner version: release-0.21
-  Cluster2 Submariner version: release-0.21
-  ⚠ VERSION MISMATCH DETECTED!
-    Cluster1: subctl v0.20 vs Submariner release-0.21
-```
-
-**Look for these patterns:**
-
-1. **Version Mismatch Between subctl and Submariner:**
-   - Line contains: "⚠ VERSION MISMATCH DETECTED!"
-   - Shows: "Cluster1: subctl vX.Y vs Submariner release-X.Y"
-   - Shows: "Cluster2: subctl vX.Y vs Submariner release-X.Y"
-
-2. **Different Submariner Versions Between Clusters:**
-   - Line contains: "⚠ Different Submariner versions between clusters"
-   - Shows different release versions for cluster1 and cluster2
-
-**Analysis:**
-
-**If version mismatch detected:**
-→ This is a **configuration issue** that can cause:
-  - Unexpected behavior in subctl commands
-  - Test failures (especially `subctl verify`)
-  - Incompatibilities between CLI and deployed components
-  - Misleading diagnostic results
-
-**If clusters have different Submariner versions:**
-→ This is **NOT recommended** and may cause:
-  - Compatibility issues between clusters
-  - Tunnel negotiation problems
-  - Unexpected connectivity failures
-
-**Recommendation:**
-
-Include version compatibility in your findings and recommendations:
-
-**For subctl version mismatch:**
-- Recommend updating subctl to match Submariner version
-- Note that diagnostic results may be affected by version mismatch
-- Warn that test failures could be due to CLI/component incompatibility
-
-**For different cluster versions:**
-- Recommend updating both clusters to the same Submariner version
-- Note this as a potential root cause if tunnel issues exist
-
-**Important:**
-- **ALWAYS display a prominent warning** if version mismatch is detected
-- Version issues should be called out early in the analysis (at the top of the report)
-- Version mismatches can mask or cause other issues
-- Always check version compatibility before diagnosing other problems
-- The warning should be impossible to miss - use visual separators and clear language
 
 #### **Analysis 1: Tunnel Health**
 
@@ -322,6 +268,60 @@ status:
 - `status`: Tunnel status (connected, error, connecting)
 - `statusMessage`: Error details if status != connected
 - `healthCheckIP`: Remote cluster's health check IP target
+
+Also check the Submariner CR spec for hosted cluster configuration:
+- `spec.hostedCluster`: If true, this is a hosted control plane deployment
+- `spec.loadBalancerEnabled`: If true, load balancer services are used for gateway connectivity
+
+**Step 1b: Check Load Balancer Service (if hostedCluster: true and loadBalancerEnabled: true)**
+
+File: `cluster*/gather/cluster*/services_submariner-operator_submariner-gateway.yaml`
+
+If the Submariner CR shows `hostedCluster: true` and `loadBalancerEnabled: true`, the gateway uses a LoadBalancer service. Verify this service is correctly configured:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: submariner-gateway
+  namespace: submariner-operator
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Cluster    # MUST be "Cluster" for hosted clusters
+  ports:
+  - name: natt-discovery
+    port: 4490
+    protocol: UDP
+  - name: cable-encaps
+    port: 4500
+    protocol: UDP
+status:
+  loadBalancer:
+    ingress:
+    - ip: 52.118.43.178              # Load balancer IP assigned
+```
+
+**Critical checks:**
+1. ✓ `spec.type: LoadBalancer` - Service type is correct
+2. ✓ `spec.externalTrafficPolicy: Cluster` - **REQUIRED for hosted clusters**
+   - Reference: https://github.com/submariner-io/submariner-operator/commit/f14c74e0c8180a64e7f38a7a82afeedd45940147
+   - If set to `Local`, gateway connectivity will fail in hosted cluster deployments
+   - Common symptom: IKE negotiation stuck at STATE_V2_PARENT_I1
+3. ✓ UDP ports exposed: 4490 (natt-discovery), 4500 (cable-encaps)
+4. ✓ `status.loadBalancer.ingress[].ip` - Load balancer IP assigned
+5. ✓ Load balancer manager: Check `managedFields` for controller (e.g., kubevirt-cloud-controller-manager)
+
+**Common issues in hosted cluster environments:**
+- **Wrong externalTrafficPolicy:** If set to `Local` instead of `Cluster`, traffic routing fails
+- **LB IP not reachable:** IP assigned from IpAddressPools but not accessible at infrastructure level
+- **UDP traffic not forwarded:** Load balancer configured but not forwarding UDP ports correctly
+- **IKE stuck at initial phase:** STATE_V2_PARENT_I1 indicates no response from remote gateway (often LB reachability issue)
+
+**If load balancer issues are found:**
+- Verify both clusters have the same `externalTrafficPolicy` setting
+- Test load balancer IP reachability between clusters
+- Ensure UDP ports 4490, 4500 are properly forwarded through the load balancer
+- Check infrastructure-level connectivity (network policies, firewall rules on host clusters)
 
 **Step 2: Verify IPsec Control Plane (if backend=libreswan)**
 
@@ -410,34 +410,6 @@ Search for ERROR, WARN, or FAIL messages. Key patterns:
 - Health check ping failures are SYMPTOMS of datapath issues
 - Look for errors related to route installation, iptables, or IPsec configuration
 - If no configuration errors exist, the issue is likely infrastructure-level
-
-**Step 7a: Check for Libreswan Version Incompatibility (CRITICAL BUG)**
-
-Search gateway logs for libreswan/whack errors:
-
-```bash
-grep -i "unrecognized option\|whack.*error.*exit status 33" gateway.log
-```
-
-**Key Patterns:**
-- `unrecognized option '--encapsulation=yes'` - Libreswan whack does not recognize flag
-- `error exit status 33 whacking with args` - Libreswan command line parsing failed
-- Repeated tunnel establishment failures with these errors
-
-**If found:**
-→ This is a **Submariner software bug** - version incompatibility between Submariner code and libreswan binary
-→ Tunnel establishment will fail completely - no IPsec tunnels created
-→ This CANNOT be fixed by configuration changes
-
-**Analysis:**
-1. Check `connections: []` in Gateway CR (empty array indicates no tunnels established)
-2. Check tcpdump shows 0 packets (no tunnel traffic)
-3. Correlate with repeated whack errors in logs
-
-**Recommendation:**
-→ **Report to Submariner community** - this is a software bug that needs expert attention
-→ Share diagnostic tarball with Submariner Slack or GitHub
-→ Include version information (subctl version, Submariner release, libreswan version)
 
 **Special Case - OpenShift on OpenStack:**
 
@@ -564,12 +536,6 @@ Read:
 - `verify/connectivity.txt` - Default packet size (~3000 bytes)
 - `verify/connectivity-small-packet.txt` - Small packet size (400 bytes)
 
-**IMPORTANT:** Check if small packet test was skipped:
-- If file contains "SMALL PACKET TEST SKIPPED" and "regular connectivity test passed":
-  → This is NORMAL - regular test already passed, so no MTU issue exists
-  → Don't report this as missing data or an issue
-  → Skip MTU analysis entirely (no MTU problem if large packets work)
-
 **MTU Issue Pattern (DEFINITIVE):**
 - Default packet test FAILS (may have stopped early after 6 failures)
 - Small packet test SUCCEEDS
@@ -584,179 +550,38 @@ Read:
 - If tunnels are connected but large packets fail, the issue is NOT at tunnel level
 - The infrastructure allows the tunnel protocol (ESP/UDP) but fragments/drops large packets
 
-**Solution: TCP MSS Clamping**
-
-In network topologies where MTU issues are observed, the encapsulation overhead added by Submariner can cause packet drops. This happens when nodes along the path don't adjust the path MTU value correctly to account for the encapsulation overhead.
-
-To resolve this, you can force a specific MSS clamping value by adding an annotation to the Gateway nodes, which instructs Submariner to rewrite the TCP Maximum Segment Size.
-
-Apply TCP MSS clamping by annotating gateway nodes:
-
-```bash
-# Annotate gateway nodes with MSS value
-kubectl annotate node <gateway-node-name> submariner.io/tcp-clamp-mss=<value>
-
-# Restart routeagent pods to pick up the change
-kubectl delete pod -n submariner-operator -l app=submariner-routeagent
-```
-
-Recommended MSS value: **1300** (accounts for encapsulation overhead in standard networks)
-
-Adjust based on your network MTU if needed.
-
-📖 **Official Documentation:** [Customize TCP MSS Clamping](https://submariner.io/getting-started/architecture/gateway-engine/) - See "Customize TCP MSS Clamping" section
+**Recommendation:**
+1. Apply TCP MSS clamping as immediate workaround
+2. Investigate underlying MTU configuration (interface MTU, path MTU discovery)
 
 **Important Notes:**
 - Health check pings use small ICMP packets, so if health checks fail, MTU is NOT the root cause
 - MTU issues only appear with large data transfers, not control plane
 - Tunnels may show "connected" status even with MTU issues (health checks still work)
+- Log errors like "CREATE_CHILD_SA failed with TS_UNACCEPTABLE" may appear but are symptoms, not root cause
 
-#### **Analysis 2b: OVNK SNAT Issues**
+#### **Analysis 3: RouteAgent Health**
 
-**IMPORTANT:** Check for OVNK-specific SNAT connectivity issues
-
-Read:
-- `verify/connectivity.txt` - Regular connectivity test results
-- `verify/connectivity-skip-src-ip-check.txt` - Connectivity with OVNK SNAT workaround (if file exists)
-- `cluster*/gather/cluster*/summary.html` - To detect CNI plugin (look for "CNI Plugin: OVNKubernetes" in HTML table)
-
-**OVNK SNAT Issue Pattern (DEFINITIVE):**
-- Regular connectivity test FAILS
-- Connectivity with `--skip-src-ip-check` PASSES
-- CNI is OVNKubernetes (detect from summary.html)
-
-→ **ROOT CAUSE: OVNK SNAT breaking Submariner connectivity** (high confidence)
-
-**Why this indicates OVNK SNAT issue:**
-- OVNK performs SNAT (Source Network Address Translation) on pod traffic
-- This SNAT changes the source IP of packets, breaking Submariner's source IP validation
-- The `--skip-src-ip-check` flag bypasses this validation, allowing connectivity
-- This is a known incompatibility between certain OVNK versions and Submariner
-
-**Solution: Apply OVNK Fix for Submariner**
-
-Some OVNK releases include a fix for Submariner compatibility that prevents SNAT from breaking cross-cluster traffic.
-
-**Check OVNK version and available fixes:**
-1. Verify your OVNK version
-2. Check if your OVNK release includes the Submariner SNAT fix
-3. If available, apply the fix following OVNK documentation
-4. If not available, consider upgrading OVNK or using a workaround
-
-**Workaround (NOT recommended for production):**
-Using `--skip-src-ip-check` is NOT recommended for production as it bypasses security validation. Only use for testing/diagnosis.
-
-📖 **Reference:** Check OVNK release notes and Submariner compatibility documentation
-
-**Important Notes:**
-- This issue ONLY affects clusters using OVN-Kubernetes CNI
-- The `connectivity-skip-src-ip-check.txt` file is only generated if:
-  - Regular connectivity tests failed
-  - OVNK CNI was detected during collection
-- If this file doesn't exist, OVNK SNAT is not the issue
-
-#### **Analysis 3: RouteAgent Health (Enhanced)**
-
-**IMPORTANT: This analysis correlates RouteAgent status with gateway-to-gateway connectivity to identify intra-cluster vs inter-cluster issues.**
-
-**Read RouteAgent CRs (individual per-node files):**
+**Read RouteAgent CR:**
 ```
-cluster*/gather/<cluster-name>/routeagents_submariner-operator_<nodename>.yaml
+cluster*/routeagents.yaml
 ```
 
-**Note:** RouteAgent CRs are now collected as individual files per node in the gather subdirectory (e.g., `cluster1/gather/prod-east/routeagents_submariner-operator_worker-01.prod-east.yaml`), not as a single `routeagents.yaml` file. Make sure to read from the correct cluster subdirectory.
+**Check each RouteAgent's `status.remoteEndpoints[].status` field:**
 
-**Also Read Gateway CR for correlation:**
-```
-cluster*/gather/<cluster-name>/submariners_submariner-operator_submariner.yaml
-```
+**Rules:**
+- **Gateway nodes:** `status: none` = OK (expected - gateway doesn't check itself)
+- **Non-gateway nodes:** `status: connected` = OK (can route through gateway)
+- **Non-gateway nodes:** `status != connected` = Problem (local routing issue)
 
-**Step 1: Check Gateway-to-Gateway Connectivity**
+**Important Distinction:**
+- If tunnel status is "error" on gateway AND non-gateway nodes also show errors:
+  → Focus on gateway-to-gateway issue FIRST
+  → Non-gateway errors are likely downstream effect of tunnel failure
+  → Don't conclude "local routing issue" when gateway tunnel is broken
 
-From the Submariner CR, check `status.gateways[]`:
-- Find the gateway with `haStatus: active`
-- Check `connections[].status`
-- Record the gateway node hostname
-
-**Step 2: Check Each RouteAgent's Status**
-
-For each RouteAgent CR, check `status.remoteEndpoints[].status`:
-
-**Status Values:**
-- `none` = Gateway node (doesn't perform health checks on itself) - **EXPECTED**
-- `connected` = Non-gateway node successfully pinging remote gateway - **HEALTHY**
-- `error` = Non-gateway node failed to ping remote gateway - **PROBLEM**
-
-**Step 3: Correlate Gateway and RouteAgent Status**
-
-**Pattern A: Gateway Connected + RouteAgents Have Errors**
-```
-Gateway → Remote Gateway: connected ✓
-Non-gateway nodes → Remote Gateway: error ✗
-```
-
-**Diagnosis: INTRA-CLUSTER ROUTING ISSUE**
-- Inter-cluster connectivity is WORKING (gateway tunnel connected)
-- Problem: Non-gateway nodes cannot reach the remote gateway IP
-- **Root cause location:** Within the LOCAL cluster
-- **Faulty segment:** Non-gateway nodes → Local gateway node's selected IP
-
-**Pattern B: Gateway Error + RouteAgents Have Errors**
-```
-Gateway → Remote Gateway: error ✗
-Non-gateway nodes → Remote Gateway: error ✗
-```
-
-**Diagnosis: INTER-CLUSTER CONNECTIVITY ISSUE**
-- Inter-cluster connectivity is BROKEN (gateway tunnel not connected)
-- Non-gateway errors are a **downstream effect** of tunnel failure
-- **Root cause location:** Between clusters (firewall, routing, etc.)
-- **Faulty segment:** Gateway node ↔ Remote gateway node
-
-**DO NOT misdiagnose:** If the gateway tunnel is broken, focus on gateway-to-gateway issues FIRST. Don't conclude "local routing issue" when the gateway tunnel itself is broken.
-
-**Step 4: Detect Common Patterns**
-
-**Control Plane Failure Pattern:**
-If multiple control plane nodes (identified by names containing `cp-`, `control`, or `master`) are failing while worker nodes are connected:
-- **Pattern:** Non-flat network topology issue
-- **Cause:** Control plane nodes likely in different subnet than gateway node
-- **Issue:** Control planes cannot reach the gateway node's selected IP address
-- **See:** Network Topology Analysis below for subnet distribution
-
-**Step 5: Check Network Topology (Conditional)**
-
-**ONLY perform network topology analysis if RouteAgent errors were detected.**
-
-If Pattern A detected (gateway connected + RouteAgent errors), analyze node IP distribution:
-
-**Read pod host IPs from:**
-```
-cluster*/gather/<cluster-name>/pods_submariner-operator_*.yaml
-```
-
-**Extract `status.hostIP` from each pod** to get node IP addresses.
-
-**Analyze subnet distribution:**
-- Group IPs by /24 subnet (first 3 octets)
-- Count nodes per subnet
-- If nodes span multiple /24 subnets: **Potential non-flat networking**
-
-**Report Format:**
-```
-Node IPs observed across X different /24 subnets:
-- 10.100.10.0/24 (3 nodes)
-- 10.100.20.0/24 (6 nodes)
-
-Note: This indicates potential non-flat networking.
-Recommend investigating network topology and routing configuration.
-```
-
-**IMPORTANT Notes:**
-- This only shows ONE IP per node (the primary IP from pod hostIP)
-- Nodes may have additional network interfaces not visible in this data
-- Don't assume this is the complete network picture
-- Use this as a **starting point for investigation**, not a definitive diagnosis
+- If tunnel status is "connected" on gateway BUT non-gateway nodes show errors:
+  → This IS a local routing issue (nodes can't route through their gateway)
 
 #### **Analysis 4: Pod Health**
 
@@ -855,25 +680,8 @@ Provide a brief report following this template:
 **Issue:** <complaint from manifest>
 **Deployment:** <Standalone Submariner / ACM-Managed>
 
----
-
-**CRITICAL: If version mismatch detected, display this warning first:**
-
-```
-⚠️  WARNING: VERSION MISMATCH DETECTED
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-The analysis results below may be INCORRECT or MISLEADING due to
-incompatibility between subctl CLI and deployed Submariner components.
-
-Recommend fixing version compatibility before trusting this analysis.
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-```
-
----
-
 ### Key Findings
 
-✓/✗ **Version Compatibility** - subctl vs Submariner versions (manifest.txt)
 ✓/✗ **Finding 1** - Brief description with file reference
 ✓/✗ **Finding 2** - Brief description with file reference
 ✓/✗ **Finding 3** - Brief description with file reference
@@ -889,55 +697,6 @@ Key evidence:
 - Evidence point 3 (file:line reference)
 
 ### Recommended Next Steps
-
-**IMPORTANT: For MTU Issues ONLY - Do NOT include the "Verify Prerequisites" section**
-
-When MTU issue is detected (small packets pass, large packets fail), provide ONLY the TCP MSS clamping solution:
-
-**Apply TCP MSS Clamping**
-
-**What it does:** Adjusts the TCP Maximum Segment Size to account for Submariner's encapsulation overhead.
-
-**Why this is needed:** Submariner encapsulation adds overhead to packets, and most probably some nodes along the path don't adjust the path MTU value correctly, so we need to force MSS clamping value.
-
-**Security Impact:** ✓ Maintains encryption - only adjusts TCP packet sizes
-
-**Steps:**
-
-1. **Annotate gateway nodes:**
-
-```bash
-kubectl --context cluster1 annotate node <gateway-node> \
-  submariner.io/tcp-clamp-mss=<value>
-
-kubectl --context cluster2 annotate node <gateway-node> \
-  submariner.io/tcp-clamp-mss=<value>
-```
-
-Recommended starting value: **1300** (accounts for encapsulation overhead in standard networks)
-
-2. **Restart routeagent pods to apply changes:**
-
-```bash
-kubectl --context cluster1 delete pod -n submariner-operator -l app=submariner-routeagent
-kubectl --context cluster2 delete pod -n submariner-operator -l app=submariner-routeagent
-```
-
-3. **Verify the fix:**
-
-Re-run the default packet size test that initially failed:
-
-```bash
-subctl verify --context cluster1 --tocontext cluster2 --only connectivity --verbose
-```
-
-Expected outcome: Default packet size tests (~3KB) that previously failed should now pass with MSS clamping enabled.
-
-📖 **Official Documentation:** [Customize TCP MSS Clamping](https://submariner.io/getting-started/architecture/gateway-engine/)
-
----
-
-**For Other Issues (Tunnel Not Connected, Firewall Blocking, etc.):**
 
 **1. Verify Submariner Prerequisites (FIRST PRIORITY)**
 
@@ -955,6 +714,14 @@ Check if required protocols are allowed between gateway nodes:
 
 ```bash
 <Concrete commands to apply workaround>
+```
+
+**3. <Alternative Workaround> (If #2 Doesn't Work)**
+
+<Brief explanation>
+
+```bash
+<Concrete commands>
 ```
 
 ### Files Analyzed
@@ -982,20 +749,6 @@ DIAGNOSTIC DATA:
   Deployment Type: <Standalone Submariner / ACM-Managed>
 
 ========================================
-VERSION COMPATIBILITY WARNING (if applicable)
-========================================
-
-**CRITICAL: If version mismatch detected, display this warning:**
-
-⚠️  WARNING: VERSION MISMATCH DETECTED
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-The analysis results below may be INCORRECT or MISLEADING due to
-incompatibility between subctl CLI and deployed Submariner components.
-
-Recommend fixing version compatibility before trusting this analysis.
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-========================================
 EXECUTIVE SUMMARY
 ========================================
 
@@ -1008,25 +761,6 @@ EXECUTIVE SUMMARY
 ========================================
 DETAILED FINDINGS
 ========================================
-
-0. VERSION COMPATIBILITY
-
-   subctl version: <version from manifest>
-   Cluster1 Submariner version: <version from manifest>
-   Cluster2 Submariner version: <version from manifest>
-
-   Version Mismatch Detected: <Yes/No>
-   Different Cluster Versions: <Yes/No>
-
-   Finding:
-   ✓/✗ Versions are compatible
-   ✗ subctl version mismatch with Submariner deployment (cluster1/cluster2)
-   ✗ Different Submariner versions between clusters (NOT recommended)
-
-   Impact:
-   - Version mismatches can cause unexpected behavior
-   - Test failures may be due to CLI/component incompatibility
-   - Diagnostic results may be misleading
 
 1. TUNNEL STATUS (Submariner Control Plane)
 
@@ -1121,10 +855,8 @@ DETAILED FINDINGS
 7. CONNECTIVITY VERIFICATION (if available)
 
    Default packet size: <PASS/FAIL>
-   Small packet size: <PASS/FAIL/SKIPPED (regular test passed - no MTU issue)>
+   Small packet size: <PASS/FAIL>
    Service discovery: <PASS/FAIL>
-
-   Note: Small packet test skipped when regular test passes (expected behavior)
 
 ========================================
 ROOT CAUSE ANALYSIS
@@ -1181,99 +913,13 @@ is encapsulated inside the IPsec tunnel, so infrastructure only sees ESP/UDP pac
 RECOMMENDED SOLUTION
 ========================================
 
-**IMPORTANT INSTRUCTIONS:**
-
-**For MTU Issues:** Skip Step 1 (Verify Prerequisites) entirely. Provide ONLY the TCP MSS clamping solution as shown below. MTU issues are not related to protocol blocking or prerequisites.
-
-**For Other Issues (Tunnel Not Connected, ESP Blocking, etc.):** Follow Steps 1-3 in order - verify prerequisites first, then apply workarounds if needed.
+**Important:** Always verify prerequisites FIRST before applying workarounds. Clearly distinguish between root cause fixes and workarounds.
 
 **Deployment Type Detected: <Standalone Submariner / ACM-Managed>**
 
 ---
 
-**For MTU Issues ONLY - TCP MSS Clamping:**
-
-**What it does:** Adjusts the TCP Maximum Segment Size to account for Submariner's encapsulation overhead.
-
-**Why this is needed:** Submariner encapsulation adds overhead to packets, and most probably some nodes along the path don't adjust the path MTU value correctly, so we need to force MSS clamping value.
-
-**Security Impact:** ✓ Maintains encryption - only adjusts TCP packet sizes
-
-**How to apply:**
-
-1. **Annotate gateway nodes:**
-
-```bash
-kubectl --context cluster1 annotate node <gateway-node> \
-  submariner.io/tcp-clamp-mss=1300
-
-kubectl --context cluster2 annotate node <gateway-node> \
-  submariner.io/tcp-clamp-mss=1300
-```
-
-2. **Restart routeagent pods to pick up the change:**
-
-```bash
-kubectl --context cluster1 delete pod -n submariner-operator -l app=submariner-routeagent
-kubectl --context cluster2 delete pod -n submariner-operator -l app=submariner-routeagent
-```
-
-3. **Verify the fix:**
-
-Re-run the default packet size test that initially failed:
-
-```bash
-subctl verify --context cluster1 --tocontext cluster2 --only connectivity --verbose
-```
-
-Expected outcome: Default packet size tests (~3KB) that previously failed should now pass with MSS clamping enabled.
-
-📖 **Official Documentation:** [Customize TCP MSS Clamping](https://submariner.io/getting-started/architecture/gateway-engine/)
-
----
-
-**For Other Issues (NOT MTU) - Step 0: Check for Submariner Software Bugs (CRITICAL - CHECK FIRST)**
-
-**Before attempting any workarounds**, check if the issue is a Submariner software bug that requires expert attention.
-
-**Key Indicators of Software Bugs:**
-
-1. **Libreswan version incompatibility:**
-   - Gateway logs show: `unrecognized option '--encapsulation=yes'`
-   - Gateway CR shows: `connections: []` (empty array)
-   - tcpdump shows: 0 packets on both clusters
-   - Repeated whack errors with exit status 33
-
-2. **Other component failures:**
-   - Repeated crashes or initialization failures in pod logs
-   - Error messages about missing dependencies or incompatible versions
-   - Submariner components unable to start
-
-**If software bug detected:**
-
-→ **This CANNOT be fixed by configuration changes or workarounds**
-→ **Report to Submariner community immediately:**
-
-**Submariner Slack Channel:**
-- https://kubernetes.slack.com/archives/C010RJV694M
-- Share the diagnostic tarball
-- Mention the specific error pattern found
-
-**GitHub Issue:**
-- https://github.com/submariner-io/submariner/issues
-- Title: Describe the bug (e.g., "Libreswan whack doesn't recognize --encapsulation=yes in release-0.22")
-- Attach diagnostic tarball
-- Include version information from manifest.txt
-
-**Red Hat Support (if using RHACM):**
-- Open support case with diagnostic tarball
-- Reference the specific component error
-
-**Do NOT proceed with workarounds below** - they will not fix software bugs.
-
----
-
-**For Other Issues (NOT MTU, NOT Software Bugs) - Step 1: Verify Submariner Prerequisites**
+**Step 1: Verify Submariner Prerequisites (FIRST PRIORITY)**
 
 Before applying any workarounds, verify that the infrastructure meets Submariner's network requirements.
 
@@ -1299,14 +945,7 @@ Before applying any workarounds, verify that the infrastructure meets Submariner
 
 **Step 2: Enable UDP Encapsulation (WORKAROUND if ESP is blocked)**
 
-**What it does:** Forces IPsec payload to be encapsulated inside UDP packets (port 4500), **regardless of whether NAT was detected**.
-
-**How Submariner NAT Discovery Works:**
-- Submariner ALWAYS runs NAT discovery process automatically
-- If NAT is detected (gateway reachable only via public IP), UDP encapsulation is used automatically
-- If no NAT detected (gateway reachable via private IP), ESP (protocol 50) is used by default
-- The `ceIPSecForceUDPEncaps` flag forces UDP encapsulation even when no NAT detected
-- The `natEnabled` field is ONLY used if NAT discovery process times out
+**What it does:** Forces IPsec payload to be encapsulated inside UDP packets (port 4500), **regardless of whether NAT was detected**. Even when Submariner NAT discovery selects private IP addresses (meaning no NAT is present), setting `ceIPSecForceUDPEncaps: true` will still use UDP encapsulation instead of native ESP.
 
 **Why it's a workaround:** Doesn't fix the infrastructure blocking of ESP protocol - works around it by forcing UDP transport. This helps when:
 - ESP (IP protocol 50) is blocked by firewall/network infrastructure
@@ -1315,8 +954,6 @@ Before applying any workarounds, verify that the infrastructure meets Submariner
 **Security Impact:** ✓ Maintains encryption - IPsec payload is still encrypted, just transported over UDP instead of ESP
 
 **How to apply:**
-
-**IMPORTANT:** For ACM-managed deployments, configuration changes must be made to **SubmarinerConfig CR on the ACM hub cluster**, NOT the Submariner CR on managed clusters. ACM will override any direct changes to Submariner CR.
 
 **For Standalone Submariner:**
 ```bash
@@ -1329,14 +966,12 @@ kubectl delete pods -n submariner-operator -l app=submariner-gateway
 
 **For ACM-Managed Submariner:**
 ```bash
-# CRITICAL: Apply changes on the ACM hub cluster, NOT on managed clusters
-# On the ACM hub cluster:
+# On the ACM hub cluster
 kubectl patch submarinerconfig -n <managed-cluster-namespace> <submarinerconfig-name> \
   --type merge \
   -p '{"spec": {"ceIPSecForceUDPEncaps": true}}'
 
-# ACM addon will propagate changes automatically to managed clusters
-# Do NOT edit Submariner CR directly - ACM will override it
+# ACM will propagate changes automatically to managed clusters
 ```
 
 **Verify the fix:**
@@ -1369,8 +1004,6 @@ Only use this if:
 
 **How to apply:**
 
-**IMPORTANT:** For ACM-managed deployments, configuration changes must be made to **SubmarinerConfig CR on the ACM hub cluster**, NOT the Submariner CR on managed clusters.
-
 **For Standalone Submariner:**
 ```bash
 kubectl patch submariner -n submariner-operator submariner \
@@ -1383,14 +1016,12 @@ kubectl delete pods -n submariner-operator -l app=submariner-routeagent
 
 **For ACM-Managed Submariner:**
 ```bash
-# CRITICAL: Apply changes on the ACM hub cluster, NOT on managed clusters
-# On the ACM hub cluster:
+# On the ACM hub cluster
 kubectl patch submarinerconfig -n <managed-cluster-namespace> <submarinerconfig-name> \
   --type merge \
   -p '{"spec": {"cableDriver": "vxlan"}}'
 
-# ACM addon will propagate changes automatically to managed clusters
-# Do NOT edit Submariner CR directly - ACM will override it
+# ACM will propagate changes automatically
 ```
 
 **Verify the fix:**
@@ -1512,10 +1143,6 @@ Refer to Submariner documentation for updating these settings based on your depl
 FILES ANALYZED
 ========================================
 
-**Version Information:**
-- manifest.txt - Version compatibility (subctl vs Submariner)
-
-**Key Configuration and Status Files:**
 <List of key files that were examined with their purposes>
 
 ========================================
@@ -1635,8 +1262,6 @@ After providing the report, be ready to:
 
 1. User provides: `/submariner:analyze-offline submariner-diagnostics-20251229-152608.tar.gz`
 2. Read manifest.txt - complaint: "general health check"
-   - Check version information: subctl v0.21, Submariner release-0.21 (both clusters)
-   - Check for version mismatch warnings
 3. Read cluster1/subctl-show-all.txt - tunnel status = "connected" from cluster1 view
 4. Read cluster2/subctl-show-all.txt - tunnel status = "error" from cluster2 view
 5. Read Gateway CR - confirm asymmetric status, usingIP=private_ip, backend=libreswan

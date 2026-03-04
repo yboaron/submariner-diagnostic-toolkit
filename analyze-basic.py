@@ -738,6 +738,103 @@ class SubmarinerAnalyzer:
                         print(f"    → Verify UDP ports 500 and 4500 are allowed in firewall/security groups")
                         print(f"    → Alternative: Consider VxLAN cable driver if UDP is blocked")
 
+    def check_loadbalancer_service(self, cluster_name):
+        """Check LoadBalancer service configuration for hosted clusters"""
+        # First check if this is a hosted cluster deployment
+        submariner_cr = self.find_and_read_gateway_cr(cluster_name)
+        if not submariner_cr or 'spec' not in submariner_cr:
+            return None
+
+        spec = submariner_cr.get('spec', {})
+        hosted_cluster = spec.get('hostedCluster', False)
+        lb_enabled = spec.get('loadBalancerEnabled', False)
+
+        if not hosted_cluster or not lb_enabled:
+            return None  # Not a hosted cluster with load balancer
+
+        # Find and read the submariner-gateway service manifest
+        gather_dir = os.path.join(self.diagnostics_dir, cluster_name, "gather")
+        if not os.path.exists(gather_dir):
+            return None
+
+        for subdir in os.listdir(gather_dir):
+            subdir_path = os.path.join(gather_dir, subdir)
+            if os.path.isdir(subdir_path):
+                service_file = "services_submariner-operator_submariner-gateway.yaml"
+                service_path = os.path.join(subdir_path, service_file)
+                if os.path.exists(service_path):
+                    service_yaml = self.read_yaml(os.path.join(cluster_name, "gather", subdir, service_file))
+                    if service_yaml:
+                        return service_yaml
+
+        return None
+
+    def analyze_loadbalancer_config(self):
+        """Analyze load balancer service configuration for hosted clusters"""
+        print(f"\n{Colors.BOLD}=== Checking Load Balancer Configuration ==={Colors.ENDC}")
+
+        for cluster_name in ['cluster1', 'cluster2']:
+            service = self.check_loadbalancer_service(cluster_name)
+            if not service:
+                continue  # Not a hosted cluster or service not found
+
+            print(f"\n  {Colors.BOLD}{cluster_name}:{Colors.ENDC}")
+
+            spec = service.get('spec', {})
+            status = service.get('status', {})
+
+            # Check service type
+            service_type = spec.get('type', '')
+            if service_type == 'LoadBalancer':
+                print(f"    ✓ Service type: LoadBalancer")
+            else:
+                print(f"    {Colors.FAIL}✗{Colors.ENDC} Service type: {service_type} (expected LoadBalancer)")
+                self.issues.append(f"{cluster_name}: Service type is not LoadBalancer")
+
+            # Check externalTrafficPolicy (CRITICAL for hosted clusters)
+            external_policy = spec.get('externalTrafficPolicy', '')
+            if external_policy == 'Cluster':
+                print(f"    ✓ externalTrafficPolicy: Cluster (correct for hosted clusters)")
+            elif external_policy == 'Local':
+                print(f"    {Colors.FAIL}✗{Colors.ENDC} externalTrafficPolicy: Local (INCORRECT for hosted clusters)")
+                print(f"      → MUST be 'Cluster' for hosted cluster deployments")
+                print(f"      → Reference: https://github.com/submariner-io/submariner-operator/commit/f14c74e0c8180a64e7f38a7a82afeedd45940147")
+                self.issues.append(f"{cluster_name}: externalTrafficPolicy is 'Local' - must be 'Cluster' for hosted clusters")
+                self.recommendations.append(
+                    f"{cluster_name}: Update submariner-gateway service to use externalTrafficPolicy: Cluster"
+                )
+            else:
+                print(f"    {Colors.WARNING}⚠{Colors.ENDC} externalTrafficPolicy: {external_policy}")
+
+            # Check load balancer IP assignment
+            lb_ingress = status.get('loadBalancer', {}).get('ingress', [])
+            if lb_ingress:
+                lb_ip = lb_ingress[0].get('ip', '')
+                print(f"    ✓ Load balancer IP assigned: {lb_ip}")
+            else:
+                print(f"    {Colors.FAIL}✗{Colors.ENDC} No load balancer IP assigned")
+                self.issues.append(f"{cluster_name}: No load balancer IP assigned")
+
+            # Check UDP ports
+            ports = spec.get('ports', [])
+            required_ports = {4490: 'natt-discovery', 4500: 'cable-encaps'}
+            found_ports = {}
+
+            for port_spec in ports:
+                port_num = port_spec.get('port')
+                port_name = port_spec.get('name', '')
+                protocol = port_spec.get('protocol', '')
+
+                if port_num in required_ports and protocol == 'UDP':
+                    found_ports[port_num] = port_name
+
+            for port_num, expected_name in required_ports.items():
+                if port_num in found_ports:
+                    print(f"    ✓ UDP port {port_num} ({expected_name}) exposed")
+                else:
+                    print(f"    {Colors.FAIL}✗{Colors.ENDC} UDP port {port_num} ({expected_name}) not found")
+                    self.issues.append(f"{cluster_name}: Missing UDP port {port_num} ({expected_name})")
+
     def analyze_tcpdump(self):
         """Analyze tcpdump data if available"""
         tcpdump_dir = os.path.join(self.diagnostics_dir, "tcpdump")
@@ -1505,6 +1602,9 @@ class SubmarinerAnalyzer:
 
             # Analyze tunnel details
             self.analyze_tunnel_status()
+
+            # Check load balancer configuration for hosted clusters
+            self.analyze_loadbalancer_config()
 
             # Analyze tcpdump for tunnel issues
             if any('tunnel' in fault.lower() for fault in self.faulty_states):
