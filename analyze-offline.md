@@ -136,6 +136,7 @@ Based on the complaint, route to appropriate analysis:
 
 1. **"tunnel not connected"** / **"tunnel error"** / **"connection down"**
    → Focus: Gateway-to-gateway tunnel analysis
+   → **CRITICAL CHECK:** Gateway HA labels - multiple active pods cause random failures
 
 2. **"pods failing"** / **"gateway crash"** / **"pods not running"**
    → Focus: Pod health analysis
@@ -143,6 +144,7 @@ Based on the complaint, route to appropriate analysis:
 3. **"connectivity issues"** / **"cannot reach pods"** / **"ping fails"**
    → Focus: Datapath analysis (both tunnel and local routing)
    → **PRIORITY CHECK:** Compare verify tests - if regular packets fail but small packets pass, this is MTU issue!
+   → **CRITICAL CHECK:** Gateway HA labels - multiple active pods cause random ~50% packet loss
 
 4. **"suspect firewall or other infrastructure issue"** / **"firewall"**
    → Focus: IPsec datapath analysis, check tcpdump data if available
@@ -153,6 +155,20 @@ Based on the complaint, route to appropriate analysis:
 6. **"general health check"** / **"not sure"** / **Generic / No specific complaint**
    → Perform comprehensive health check
    → **ALWAYS check MTU pattern** if verify tests exist (compare regular vs small packet results)
+
+**SPECIAL ATTENTION - Random/Intermittent Failures:**
+
+If the complaint mentions:
+- "random failures"
+- "intermittent connectivity"
+- "works sometimes, fails other times"
+- "breaks ODF-RDR randomly"
+- "tunnel flapping"
+
+**→ IMMEDIATELY CHECK:** Gateway HA labels for multiple active pods
+- This is the #1 cause of random/intermittent tunnel failures
+- Multiple active pods → load balancer splits traffic → ~50% packet loss
+- Explains random success/failure pattern
 
 ### Phase 4: Read Diagnostic Files
 
@@ -212,6 +228,19 @@ Based on the complaint, route to appropriate analysis:
 #### E. For Pod Health Issues:
 1. `cluster1/gather/cluster*/pods_*.yaml` - Pod status
 2. `cluster1/gather/cluster*/*-submariner-*.log` - Pod logs
+
+#### E2. For Gateway HA Label Issues (CRITICAL - Always Check):
+**IMPORTANT:** Check this for ANY tunnel connectivity issues, especially random/intermittent failures.
+
+1. `cluster1/gather/cluster*/submariners_submariner-operator_submariner.yaml` - Gateway CR (source of truth for HA state)
+2. `cluster2/gather/cluster*/submariners_submariner-operator_submariner.yaml` - Gateway CR
+3. `cluster1/gather/cluster*/pods_submariner-operator_submariner-gateway-*.yaml` - Gateway pod labels
+4. `cluster2/gather/cluster*/pods_submariner-operator_submariner-gateway-*.yaml` - Gateway pod labels
+
+**Check for:**
+- Gateway CR `status.gateways[].haStatus` (expected: 1 active, N passive)
+- Pod label `gateway.submariner.io/status` (must match CR haStatus)
+- **BUG PATTERN:** Multiple pods labeled "active" → load balancer splits traffic → random failures
 
 #### F. For Connectivity Issues:
 1. `verify/connectivity.txt` - Default packet size results
@@ -600,7 +629,113 @@ cluster*/gather/cluster*/pods_*.yaml
 cluster*/gather/cluster*/*-submariner-*.log
 ```
 
-#### **Analysis 5: Service Discovery**
+#### **Analysis 5: Gateway HA Labels (CRITICAL - Check for Multiple Active Pods)**
+
+**IMPORTANT:** Submariner only supports Active/Passive HA mode - there should be EXACTLY 1 pod labeled as "active" per cluster.
+
+**Read Gateway CR to get expected HA state:**
+```
+cluster*/gather/cluster*/submariners_submariner-operator_submariner.yaml
+```
+
+**Check Gateway CR for expected active/passive state:**
+```yaml
+status:
+  gateways:
+  - haStatus: active
+    localEndpoint:
+      hostname: kube-xxxxx-node1  # Expected active node
+  - haStatus: passive
+    localEndpoint:
+      hostname: kube-xxxxx-node2  # Expected passive node
+```
+
+**Read gateway pod YAMLs to check actual pod labels:**
+```
+cluster*/gather/cluster*/pods_submariner-operator_submariner-gateway-*.yaml
+```
+
+**Check each pod's label:**
+```yaml
+metadata:
+  labels:
+    gateway.submariner.io/status: active   # OR passive
+  name: submariner-gateway-xxxxx
+spec:
+  nodeName: kube-xxxxx-node1
+```
+
+**Detection Pattern - CRITICAL BUG:**
+
+If you find **multiple pods labeled "active"** in the same cluster:
+
+```
+Expected: 1 pod with label "active", N pods with label "passive"
+Found:    2+ pods with label "active"  ← BUG!
+```
+
+**This is a CRITICAL HA label synchronization bug:**
+
+1. **Root Cause:**
+   - Race condition in Submariner gateway HA election logic
+   - Pod labels out of sync with Gateway CR HA state
+   - Typically happens during gateway failovers or pod restarts
+
+2. **Impact on Load Balancer:**
+   ```yaml
+   # Load Balancer Service selector
+   spec:
+     selector:
+       app: submariner-gateway
+       gateway.submariner.io/status: active  # Matches ALL pods labeled "active"
+   ```
+   - If 2 pods labeled "active" → LB routes to 2 nodes
+   - Traffic split 50/50 between nodes
+   - Only 1 pod has actual tunnel connection
+   - Result: ~50% packet loss, random tunnel failures
+
+3. **Why This Causes Random Failures:**
+   - UDP packets distributed by load balancer
+   - Some packets hit correct node (active with tunnel) → success
+   - Some packets hit wrong node (labeled active, but passive) → dropped
+   - Explains intermittent connectivity, breaks ODF-RDR
+
+**Recommended Analysis Output:**
+
+If multiple active pods detected:
+
+```
+ROOT CAUSE: Gateway HA label synchronization bug (race condition)
+  - Gateway CR shows: 1 active, 1 passive (correct)
+  - Pod labels show: 2 active, 0 passive (WRONG!)
+  - Load balancer selector matches both pods
+  - Traffic split causes ~50% packet loss
+
+IMMEDIATE FIX:
+  # Fix the label on passive pod (node that SHOULD be passive per Gateway CR)
+  kubectl label pod -n submariner-operator <passive-pod-name> \
+    gateway.submariner.io/status=passive --overwrite
+
+WORKAROUND (if issue recurs):
+  # Change externalTrafficPolicy to allow cross-node forwarding
+  kubectl patch service -n submariner-operator submariner-gateway \
+    --type merge -p '{"spec": {"externalTrafficPolicy": "Cluster"}}'
+
+COLLECT LOGS FOR BUG REPORT:
+  1. Operator logs:
+     kubectl logs -n submariner-operator deployment/submariner-operator > operator.log
+
+  2. Gateway pod logs (ALL pods):
+     kubectl logs -n submariner-operator submariner-gateway-xxxxx > gateway1.log
+     kubectl logs -n submariner-operator submariner-gateway-yyyyy > gateway2.log
+
+  3. File bug with Submariner project:
+     https://github.com/submariner-io/submariner/issues
+     Title: "Gateway HA label sync race condition - multiple active pods"
+     Include: Gateway CR, pod YAMLs, operator logs, gateway pod logs, release version
+```
+
+#### **Analysis 6: Service Discovery**
 
 **Read:**
 ```

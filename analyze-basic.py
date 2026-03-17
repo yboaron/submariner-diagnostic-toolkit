@@ -1049,6 +1049,157 @@ class SubmarinerAnalyzer:
                                     }
         return None
 
+    def analyze_gateway_ha_labels(self):
+        """Check for multiple active gateway pods (HA label synchronization bug)"""
+        print(f"\n{Colors.BOLD}=== Analyzing Gateway HA Labels ==={Colors.ENDC}")
+
+        for cluster in ['cluster1', 'cluster2']:
+            cluster_dir = os.path.join(self.diagnostics_dir, cluster)
+            if not os.path.exists(cluster_dir):
+                continue
+
+            # Find the gather subdirectory
+            gather_base = os.path.join(cluster_dir, "gather")
+            if not os.path.exists(gather_base):
+                continue
+
+            # Navigate through nested subdirectories to find the actual gather data
+            # Structure can be: cluster/gather/acm-name/k8s-id/ or cluster/gather/cluster-name/
+            gather_dir = None
+            current_dir = gather_base
+            depth = 0
+
+            while depth < 4:
+                # Check if current directory contains YAML files
+                all_files = os.listdir(current_dir)
+                yaml_files = [f for f in all_files if f.endswith('.yaml')]
+
+                if yaml_files:
+                    gather_dir = current_dir
+                    break
+
+                # Get subdirectories
+                subdirs = [d for d in all_files if os.path.isdir(os.path.join(current_dir, d))]
+
+                if not subdirs:
+                    # No more subdirs, check current dir for YAMLs one more time
+                    if yaml_files:
+                        gather_dir = current_dir
+                    break
+
+                # Move to first subdir
+                current_dir = os.path.join(current_dir, subdirs[0])
+                depth += 1
+
+            if not gather_dir:
+                continue
+
+            # Read Gateway CR to get expected HA state
+            gateway_cr = None
+            for file in os.listdir(gather_dir):
+                if file.startswith("submariners_submariner-operator_submariner") and file.endswith(".yaml"):
+                    # Use relative path from diagnostics_dir
+                    relative_path = os.path.relpath(os.path.join(gather_dir, file), self.diagnostics_dir)
+                    gateway_cr = self.read_yaml(relative_path)
+                    break
+
+            if not gateway_cr:
+                continue
+
+            # Get expected HA state from Gateway CR
+            gateways = gateway_cr.get('status', {}).get('gateways', [])
+            expected_active_count = sum(1 for gw in gateways if gw.get('haStatus') == 'active')
+            expected_passive_count = sum(1 for gw in gateways if gw.get('haStatus') == 'passive')
+
+            # Get active node from Gateway CR
+            expected_active_node = None
+            expected_passive_nodes = []
+            for gw in gateways:
+                if gw.get('haStatus') == 'active':
+                    expected_active_node = gw.get('localEndpoint', {}).get('hostname', 'unknown')
+                elif gw.get('haStatus') == 'passive':
+                    expected_passive_nodes.append(gw.get('localEndpoint', {}).get('hostname', 'unknown'))
+
+            # Read gateway pod YAMLs to check actual labels
+            active_pods = []
+            passive_pods = []
+
+            for file in os.listdir(gather_dir):
+                if file.startswith("pods_submariner-operator_submariner-gateway") and file.endswith(".yaml"):
+                    # Use relative path from diagnostics_dir
+                    relative_path = os.path.relpath(os.path.join(gather_dir, file), self.diagnostics_dir)
+                    pod_yaml = self.read_yaml(relative_path)
+                    if pod_yaml:
+                        labels = pod_yaml.get('metadata', {}).get('labels', {})
+                        pod_name = pod_yaml.get('metadata', {}).get('name', 'unknown')
+                        node_name = pod_yaml.get('spec', {}).get('nodeName', 'unknown')
+                        ha_label = labels.get('gateway.submariner.io/status', 'unknown')
+
+                        if ha_label == 'active':
+                            active_pods.append((pod_name, node_name))
+                        elif ha_label == 'passive':
+                            passive_pods.append((pod_name, node_name))
+
+            # Check for mismatch
+            if len(active_pods) > 1:
+                print(f"  {Colors.FAIL}✗ CRITICAL BUG DETECTED{Colors.ENDC} {cluster}: Multiple pods labeled 'active'")
+                print(f"    Expected: 1 active gateway pod")
+                print(f"    Found: {len(active_pods)} pods labeled 'active':")
+                for pod_name, node_name in active_pods:
+                    # Check if this is the expected active node
+                    expected = " (expected active per Gateway CR)" if node_name == expected_active_node else " (SHOULD BE PASSIVE per Gateway CR)"
+                    print(f"      - {pod_name} on node {node_name}{expected}")
+
+                print(f"\n  {Colors.WARNING}ROOT CAUSE:{Colors.ENDC}")
+                print(f"    This appears to be a race condition in Submariner's gateway HA election logic.")
+                print(f"    Pod labels are out of sync with Gateway CR HA state.")
+                print(f"\n  {Colors.WARNING}IMPACT:{Colors.ENDC}")
+                print(f"    - Load balancer service selector: gateway.submariner.io/status=active")
+                print(f"    - Load balancer routes to ALL {len(active_pods)} pods (traffic split)")
+                print(f"    - Only 1 pod has actual tunnel connection")
+                print(f"    - Result: ~{100 // len(active_pods)}% packet loss, random tunnel failures")
+                print(f"\n  {Colors.WARNING}IMMEDIATE FIX:{Colors.ENDC}")
+
+                # Identify which pods need label correction
+                for pod_name, node_name in active_pods:
+                    if node_name != expected_active_node:
+                        print(f"    kubectl label pod -n submariner-operator {pod_name} \\")
+                        print(f"      gateway.submariner.io/status=passive --overwrite")
+
+                print(f"\n  {Colors.WARNING}WORKAROUND (if issue recurs):{Colors.ENDC}")
+                print(f"    Change externalTrafficPolicy from 'Local' to 'Cluster':")
+                print(f"    kubectl patch service -n submariner-operator submariner-gateway \\")
+                print(f"      --type merge -p '{{\"spec\": {{\"externalTrafficPolicy\": \"Cluster\"}}}}'")
+
+                print(f"\n  {Colors.WARNING}RECOMMENDED:{Colors.ENDC}")
+                print(f"    1. Collect operator logs for HA election analysis:")
+                print(f"       kubectl logs -n submariner-operator deployment/submariner-operator > operator.log")
+                print(f"    2. Collect gateway pod logs from ALL gateway pods:")
+                for pod_name, node_name in active_pods:
+                    print(f"       kubectl logs -n submariner-operator {pod_name} > {pod_name}.log")
+                for pod_name, node_name in passive_pods:
+                    print(f"       kubectl logs -n submariner-operator {pod_name} > {pod_name}.log")
+                print(f"    3. File a bug report with Submariner project:")
+                print(f"       https://github.com/submariner-io/submariner/issues")
+                print(f"       Include: Gateway CR, pod YAMLs, operator logs, gateway logs")
+                print(f"       Release version: {gateway_cr.get('status', {}).get('version', 'unknown')}")
+
+                self.faulty_states.append(f"{cluster}: Multiple active gateway pods detected (HA label sync bug)")
+                self.issues.append(f"{cluster}: CRITICAL - {len(active_pods)} gateway pods labeled 'active' (expected 1)")
+                self.recommendations.append(f"{cluster}: Fix pod labels immediately - correct passive pod labels to prevent load balancer traffic splitting")
+                self.recommendations.append(f"{cluster}: File bug with Submariner - HA election race condition causing label sync issues")
+
+            elif len(active_pods) == 1:
+                active_pod, active_node = active_pods[0]
+                if active_node == expected_active_node:
+                    print(f"  {Colors.OKGREEN}✓{Colors.ENDC} {cluster}: Gateway HA labels correct (1 active pod on expected node)")
+                else:
+                    print(f"  {Colors.WARNING}⚠{Colors.ENDC} {cluster}: Active pod on unexpected node")
+                    print(f"    Expected active node: {expected_active_node}")
+                    print(f"    Actual active pod: {active_pod} on {active_node}")
+            else:
+                print(f"  {Colors.WARNING}⚠{Colors.ENDC} {cluster}: No active gateway pods found")
+
     def analyze_routeagents(self):
         """Analyze RouteAgent resources to detect connectivity issues"""
         print(f"\n{Colors.BOLD}=== Analyzing RouteAgent Resources ==={Colors.ENDC}")
@@ -1612,6 +1763,9 @@ class SubmarinerAnalyzer:
 
             # Analyze pod health
             self.analyze_pod_health()
+
+            # Check gateway HA labels (critical: multiple active pods)
+            self.analyze_gateway_ha_labels()
 
         # Generate report
         self.generate_report()
