@@ -242,6 +242,9 @@ class SubmarinerAnalyzer:
         # Check firewall diagnostics
         self.check_firewall_diagnostics()
 
+        # CRITICAL: Check Gateway HA labels early (can cause tunnel issues)
+        self.check_gateway_ha_labels_early()
+
         if not self.faulty_states:
             print(f"\n{Colors.OKGREEN}✓ No faulty states detected - Submariner deployment appears healthy{Colors.ENDC}")
             return False
@@ -686,14 +689,27 @@ class SubmarinerAnalyzer:
         if not os.path.exists(gather_dir):
             return None
 
-        # Find cluster subdirectory
-        for subdir in os.listdir(gather_dir):
-            subdir_path = os.path.join(gather_dir, subdir)
-            if os.path.isdir(subdir_path):
-                # Look for submariner CR YAML
-                for file in os.listdir(subdir_path):
-                    if file.startswith("submariners_") and file.endswith(".yaml"):
-                        return self.read_yaml(os.path.join(cluster, "gather", subdir, file))
+        # Navigate through nested subdirectories (can be cluster/gather/name/k8s-id/)
+        current_dir = gather_dir
+        depth = 0
+
+        while depth < 4:
+            all_files = os.listdir(current_dir)
+
+            # Look for submariner CR YAML in current directory
+            for file in all_files:
+                if file.startswith("submariners_") and file.endswith(".yaml"):
+                    relative_path = os.path.relpath(os.path.join(current_dir, file), self.diagnostics_dir)
+                    return self.read_yaml(relative_path)
+
+            # If not found, go deeper
+            subdirs = [d for d in all_files if os.path.isdir(os.path.join(current_dir, d))]
+            if not subdirs:
+                break
+
+            current_dir = os.path.join(current_dir, subdirs[0])
+            depth += 1
+
         return None
 
     def analyze_gateway_blocking(self, gateway_cr, cluster_name):
@@ -1049,6 +1065,65 @@ class SubmarinerAnalyzer:
                                     }
         return None
 
+    def check_gateway_ha_labels_early(self):
+        """Early check for Gateway HA status and Endpoint consistency"""
+        gateway_data = {}
+
+        for cluster in ['cluster1', 'cluster2']:
+            # Read Gateway CR (authoritative source for HA state)
+            gateway_cr = self.find_and_read_gateway_cr(cluster)
+            if not gateway_cr or 'status' not in gateway_cr:
+                continue
+
+            gateways = gateway_cr.get('status', {}).get('gateways', [])
+
+            # Count active gateways in CR (this is the critical check)
+            active_gateways = [gw for gw in gateways if gw.get('haStatus') == 'active']
+            passive_gateways = [gw for gw in gateways if gw.get('haStatus') == 'passive']
+
+            gateway_data[cluster] = {
+                'active_count': len(active_gateways),
+                'passive_count': len(passive_gateways),
+                'gateways': gateways
+            }
+
+            # CRITICAL: Only ONE Gateway resource should have haStatus: active
+            if len(active_gateways) != 1:
+                self.faulty_states.append(f"{cluster}: {len(active_gateways)} Gateway resources with haStatus='active' (expected 1)")
+                print(f"  {Colors.FAIL}✗{Colors.ENDC} {cluster}: CRITICAL - {len(active_gateways)} Gateway resources report haStatus='active' (expected 1)")
+            else:
+                print(f"  {Colors.OKGREEN}✓{Colors.ENDC} {cluster}: Gateway CR shows 1 active gateway")
+
+        # Check Endpoint visibility across clusters
+        if len(gateway_data) == 2:
+            cluster1_endpoints = set()
+            cluster2_endpoints = set()
+
+            for gw in gateway_data.get('cluster1', {}).get('gateways', []):
+                for conn in gw.get('connections', []):
+                    endpoint = conn.get('endpoint', {})
+                    cluster_id = endpoint.get('cluster_id', '')
+                    if cluster_id:
+                        cluster1_endpoints.add(cluster_id)
+
+            for gw in gateway_data.get('cluster2', {}).get('gateways', []):
+                for conn in gw.get('connections', []):
+                    endpoint = conn.get('endpoint', {})
+                    cluster_id = endpoint.get('cluster_id', '')
+                    if cluster_id:
+                        cluster2_endpoints.add(cluster_id)
+
+            # Verify endpoints - both clusters should have endpoint connections
+            if cluster1_endpoints and cluster2_endpoints:
+                print(f"  {Colors.OKGREEN}✓{Colors.ENDC} Endpoint resources present on both clusters")
+            elif not cluster1_endpoints and not cluster2_endpoints:
+                self.faulty_states.append("No endpoint connections found on either cluster")
+                print(f"  {Colors.FAIL}✗{Colors.ENDC} No endpoint connections found on either cluster")
+            else:
+                missing_cluster = "cluster1" if not cluster1_endpoints else "cluster2"
+                self.faulty_states.append(f"{missing_cluster}: No endpoint connections found")
+                print(f"  {Colors.FAIL}✗{Colors.ENDC} {missing_cluster}: No endpoint connections found")
+
     def analyze_gateway_ha_labels(self):
         """Check for multiple active gateway pods (HA label synchronization bug)"""
         print(f"\n{Colors.BOLD}=== Analyzing Gateway HA Labels ==={Colors.ENDC}")
@@ -1142,20 +1217,20 @@ class SubmarinerAnalyzer:
 
             # Check for mismatch
             if len(active_pods) > 1:
-                print(f"  {Colors.FAIL}✗ CRITICAL BUG DETECTED{Colors.ENDC} {cluster}: Multiple pods labeled 'active'")
+                print(f"  {Colors.WARNING}⚠ Pod label issue detected:{Colors.ENDC} {cluster}: {len(active_pods)} pods labeled 'active'")
                 print(f"    Expected: 1 active gateway pod")
                 print(f"    Found: {len(active_pods)} pods labeled 'active':")
                 for pod_name, node_name in active_pods:
                     # Check if this is the expected active node
-                    expected = " (expected active per Gateway CR)" if node_name == expected_active_node else " (SHOULD BE PASSIVE per Gateway CR)"
+                    expected = " (expected active per Gateway CR)" if node_name == expected_active_node else " (should be passive per Gateway CR)"
                     print(f"      - {pod_name} on node {node_name}{expected}")
 
-                print(f"\n  {Colors.WARNING}ROOT CAUSE:{Colors.ENDC}")
-                print(f"    This appears to be a race condition in Submariner's gateway HA election logic.")
-                print(f"    Pod labels are out of sync with Gateway CR HA state.")
-                print(f"\n  {Colors.WARNING}IMPACT:{Colors.ENDC}")
-                print(f"    - Load balancer service selector: gateway.submariner.io/status=active")
-                print(f"    - Load balancer routes to ALL {len(active_pods)} pods (traffic split)")
+                print(f"\n  {Colors.WARNING}Possible Issue:{Colors.ENDC}")
+                print(f"    Pod labels may be out of sync with Gateway CR HA state.")
+                print(f"    This could indicate a race condition in gateway HA election logic.")
+                print(f"\n  {Colors.WARNING}Possible Impact:{Colors.ENDC}")
+                print(f"    - If using LoadBalancer service with selector 'gateway.submariner.io/status=active'")
+                print(f"    - Load balancer might route to ALL {len(active_pods)} pods (traffic split)")
                 print(f"    - Only 1 pod has actual tunnel connection")
                 print(f"    - Result: ~{100 // len(active_pods)}% packet loss, random tunnel failures")
                 print(f"\n  {Colors.WARNING}IMMEDIATE FIX:{Colors.ENDC}")
@@ -1719,6 +1794,200 @@ class SubmarinerAnalyzer:
         print(f"  See README.md for instructions on setting up advanced AI analysis")
         print(f"{Colors.BOLD}{'='*60}{Colors.ENDC}\n")
 
+    def check_api_server_health(self):
+        """Check for API server rate limiter errors in Gateway pod logs"""
+        print(f"\n{Colors.BOLD}=== Checking API Server Health ==={Colors.ENDC}")
+
+        cluster_subdirs = self.get_cluster_subdirs()
+        if not cluster_subdirs:
+            return
+
+        for cluster in ['cluster1', 'cluster2']:
+            actual_cluster_name = cluster_subdirs.get(cluster)
+            if not actual_cluster_name:
+                continue
+
+            gather_dir = os.path.join(self.diagnostics_dir, cluster, "gather", actual_cluster_name)
+            if not os.path.exists(gather_dir):
+                continue
+
+            # Find Gateway pod logs
+            gateway_logs = []
+            for file in os.listdir(gather_dir):
+                if "submariner-gateway-" in file and file.endswith("-submariner-gateway.log"):
+                    gateway_logs.append(os.path.join(cluster, "gather", actual_cluster_name, file))
+
+            if not gateway_logs:
+                continue
+
+            # Check for rate limiter errors
+            rate_limiter_errors = 0
+            for log_file in gateway_logs:
+                content = self.read_file(log_file)
+                if content:
+                    rate_limiter_errors += content.count("rate limiter Wait returned an error")
+
+            if rate_limiter_errors > 0:
+                self.issues.append(f"{cluster}: API server showing {rate_limiter_errors} rate limiter errors")
+                print(f"  {Colors.FAIL}✗{Colors.ENDC} {cluster}: Found {rate_limiter_errors} API server rate limiter errors")
+                print(f"    → This could indicate API server performance/stability issues")
+                self.recommendations.append(f"{cluster}: Consider checking API server health with 'oc adm top nodes', control plane resource utilization, and API server logs")
+            else:
+                print(f"  {Colors.OKGREEN}✓{Colors.ENDC} {cluster}: No API server rate limiter errors detected")
+
+    def check_ip_rule_consistency(self):
+        """Check for IP rule differences between clusters, especially fwmark 0x3f0"""
+        print(f"\n{Colors.BOLD}=== Checking IP Rule Consistency ==={Colors.ENDC}")
+
+        cluster_subdirs = self.get_cluster_subdirs()
+        if not cluster_subdirs:
+            return
+
+        fwmark_0x3f0_clusters = []
+
+        for cluster in ['cluster1', 'cluster2']:
+            actual_cluster_name = cluster_subdirs.get(cluster)
+            if not actual_cluster_name:
+                continue
+
+            gather_dir = os.path.join(self.diagnostics_dir, cluster, "gather", actual_cluster_name)
+            if not os.path.exists(gather_dir):
+                continue
+
+            # Find ip-rules.log files
+            has_fwmark_rule = False
+            node_count = 0
+            affected_nodes = []
+
+            for file in os.listdir(gather_dir):
+                if file.endswith("_ip-rules.log"):
+                    node_count += 1
+                    node_name = file.replace("_ip-rules.log", "")
+                    content = self.read_file(os.path.join(cluster, "gather", actual_cluster_name, file))
+                    if content and "fwmark 0x3f0" in content:
+                        has_fwmark_rule = True
+                        affected_nodes.append(node_name)
+
+            if has_fwmark_rule:
+                fwmark_0x3f0_clusters.append({
+                    'cluster': cluster,
+                    'nodes': affected_nodes,
+                    'total_nodes': node_count
+                })
+
+        # Report findings
+        if len(fwmark_0x3f0_clusters) == 1:
+            cluster_info = fwmark_0x3f0_clusters[0]
+            cluster_name = cluster_info['cluster']
+            print(f"  {Colors.FAIL}✗{Colors.ENDC} IP rule inconsistency detected!")
+            print(f"    {cluster_name}: Has 'fwmark 0x3f0' rule on {len(cluster_info['nodes'])}/{cluster_info['total_nodes']} nodes")
+
+            other_cluster = 'cluster2' if cluster_name == 'cluster1' else 'cluster1'
+            print(f"    {other_cluster}: Does NOT have this rule")
+
+            self.issues.append(f"{cluster_name}: Has extra IP rule 'fwmark 0x3f0' that {other_cluster} doesn't have")
+            print(f"\n    {Colors.WARNING}Possible Impact:{Colors.ENDC} Gateway pod traffic may be marked with fwmark 0x3f0,")
+            print(f"    which could cause packets to bypass table 150 routes and use main table instead.")
+            print(f"    This might lead to 'source IP = 0.0.0.0' errors in health check pings.")
+            self.recommendations.append(f"{cluster_name}: Consider investigating why 'ip rule fwmark 0x3f0' exists - it appears to be added by OVN-Kubernetes or NetworkPolicy")
+
+        elif len(fwmark_0x3f0_clusters) == 2:
+            print(f"  {Colors.OKGREEN}✓{Colors.ENDC} Both clusters have 'fwmark 0x3f0' rule (consistent)")
+        else:
+            print(f"  {Colors.OKGREEN}✓{Colors.ENDC} Neither cluster has 'fwmark 0x3f0' rule (consistent)")
+
+    def check_ovn_routing(self):
+        """Check OVN Logical_Router_Static_Route configuration"""
+        print(f"\n{Colors.BOLD}=== Checking OVN Routing Configuration ==={Colors.ENDC}")
+
+        cluster_subdirs = self.get_cluster_subdirs()
+        if not cluster_subdirs:
+            return
+
+        for cluster in ['cluster1', 'cluster2']:
+            actual_cluster_name = cluster_subdirs.get(cluster)
+            if not actual_cluster_name:
+                continue
+
+            gather_dir = os.path.join(self.diagnostics_dir, cluster, "gather", actual_cluster_name)
+            if not os.path.exists(gather_dir):
+                continue
+
+            # Find gateway node (check one node for OVN routes)
+            gateway_node = None
+            for file in os.listdir(gather_dir):
+                if file.endswith("_ovn_lr_ovn_cluster_router_routes.log"):
+                    gateway_node = file.replace("_ovn_lr_ovn_cluster_router_routes.log", "")
+                    routes_content = self.read_file(os.path.join(cluster, "gather", actual_cluster_name, file))
+
+                    if routes_content:
+                        # Look for Submariner-added routes (check for remote cluster CIDRs)
+                        # Get remote cluster CIDRs from Gateway CR
+                        gateway_cr = self.find_and_read_gateway_cr(cluster)
+                        if gateway_cr and 'status' in gateway_cr:
+                            gateways = gateway_cr['status'].get('gateways', [])
+                            for gw in gateways:
+                                connections = gw.get('connections', [])
+                                for conn in connections:
+                                    endpoint = conn.get('endpoint', {})
+                                    subnets = endpoint.get('subnets', [])
+                                    for subnet in subnets:
+                                        if subnet in routes_content:
+                                            print(f"  {Colors.OKGREEN}✓{Colors.ENDC} {cluster}: OVN route found for {subnet}")
+                                        else:
+                                            print(f"  {Colors.FAIL}✗{Colors.ENDC} {cluster}: OVN route MISSING for {subnet}")
+                                            self.issues.append(f"{cluster}: OVN Logical_Router_Static_Route missing for {subnet}")
+                    break
+
+    def check_main_table_routes(self):
+        """Check if main routing table has routes to remote cluster CIDRs"""
+        print(f"\n{Colors.BOLD}=== Checking Main Routing Table ==={Colors.ENDC}")
+
+        cluster_subdirs = self.get_cluster_subdirs()
+        if not cluster_subdirs:
+            return
+
+        for cluster in ['cluster1', 'cluster2']:
+            actual_cluster_name = cluster_subdirs.get(cluster)
+            if not actual_cluster_name:
+                continue
+
+            gather_dir = os.path.join(self.diagnostics_dir, cluster, "gather", actual_cluster_name)
+            if not os.path.exists(gather_dir):
+                continue
+
+            # Get remote cluster CIDRs from Gateway CR
+            gateway_cr = self.find_and_read_gateway_cr(cluster)
+            if not gateway_cr or 'status' not in gateway_cr:
+                continue
+
+            remote_cidrs = set()
+            gateways = gateway_cr['status'].get('gateways', [])
+            for gw in gateways:
+                connections = gw.get('connections', [])
+                for conn in connections:
+                    endpoint = conn.get('endpoint', {})
+                    subnets = endpoint.get('subnets', [])
+                    remote_cidrs.update(subnets)
+
+            # Check gateway node's main routing table
+            for file in os.listdir(gather_dir):
+                if file.endswith("_ip-routes.log"):
+                    routes_content = self.read_file(os.path.join(cluster, "gather", actual_cluster_name, file))
+                    if routes_content:
+                        has_remote_routes = False
+                        for cidr in remote_cidrs:
+                            if cidr in routes_content:
+                                has_remote_routes = True
+                                break
+
+                        if has_remote_routes:
+                            print(f"  {Colors.WARNING}⚠{Colors.ENDC} {cluster}: Main table has routes to remote clusters")
+                            print(f"    → This is unusual; Submariner typically uses table 150")
+                        else:
+                            print(f"  {Colors.OKGREEN}✓{Colors.ENDC} {cluster}: Main table does NOT have remote cluster routes (expected)")
+                    break
+
     def run(self):
         """Run full analysis"""
         print(f"\n{Colors.BOLD}Submariner Basic Diagnostic Analyzer{Colors.ENDC}")
@@ -1756,6 +2025,19 @@ class SubmarinerAnalyzer:
 
             # Check load balancer configuration for hosted clusters
             self.analyze_loadbalancer_config()
+
+            # NEW: Check API server health for rate limiter errors
+            self.check_api_server_health()
+
+            # NEW: Check IP rule consistency between clusters
+            self.check_ip_rule_consistency()
+
+            # NEW: Check OVN routing configuration
+            cni_cluster1 = self.detect_cni("cluster1")
+            cni_cluster2 = self.detect_cni("cluster2")
+            if "OVN" in cni_cluster1 or "OVN" in cni_cluster2:
+                self.check_ovn_routing()
+                self.check_main_table_routes()
 
             # Analyze tcpdump for tunnel issues
             if any('tunnel' in fault.lower() for fault in self.faulty_states):

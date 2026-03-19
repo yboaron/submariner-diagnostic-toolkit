@@ -132,11 +132,25 @@ Read both files from cluster1:
 
 Based on the complaint, route to appropriate analysis:
 
+**CRITICAL CHECKS (Always performed early):**
+- **Gateway CR HA Status** - Only ONE Gateway resource should have `haStatus: active`
+  - This is the authoritative source for HA state (not pod labels)
+  - This check runs BEFORE deep analysis as it can be the root cause of tunnel issues
+  - If detected: Flag as critical faulty state immediately
+- **Endpoint Consistency** - All clusters should see the same Endpoint resources
+  - Both clusters should have consistent view of remote endpoints
+  - Inconsistency may indicate broker or network issues
+
 **Common complaints and their focus areas:**
 
 1. **"tunnel not connected"** / **"tunnel error"** / **"connection down"**
    → Focus: Gateway-to-gateway tunnel analysis
-   → **CRITICAL CHECK:** Gateway HA labels - multiple active pods cause random failures
+   → **Already checked:** Gateway HA labels (checked early in all cases)
+   → **NEW CHECKS (if OVN-Kubernetes):**
+     - API server health (rate limiter errors might indicate instability)
+     - IP rule consistency (fwmark 0x3f0 differences could affect routing)
+     - OVN routing configuration (Logical_Router_Static_Route verification)
+     - Packet marking patterns (pkt_mark=1008 + fwmark rule may cause routing bypass)
 
 2. **"pods failing"** / **"gateway crash"** / **"pods not running"**
    → Focus: Pod health analysis
@@ -229,18 +243,24 @@ If the complaint mentions:
 1. `cluster1/gather/cluster*/pods_*.yaml` - Pod status
 2. `cluster1/gather/cluster*/*-submariner-*.log` - Pod logs
 
-#### E2. For Gateway HA Label Issues (CRITICAL - Always Check):
+#### E2. For Gateway HA Status (CRITICAL - Always Check):
 **IMPORTANT:** Check this for ANY tunnel connectivity issues, especially random/intermittent failures.
 
-1. `cluster1/gather/cluster*/submariners_submariner-operator_submariner.yaml` - Gateway CR (source of truth for HA state)
+1. `cluster1/gather/cluster*/submariners_submariner-operator_submariner.yaml` - Gateway CR (authoritative source for HA state)
 2. `cluster2/gather/cluster*/submariners_submariner-operator_submariner.yaml` - Gateway CR
-3. `cluster1/gather/cluster*/pods_submariner-operator_submariner-gateway-*.yaml` - Gateway pod labels
-4. `cluster2/gather/cluster*/pods_submariner-operator_submariner-gateway-*.yaml` - Gateway pod labels
+3. `cluster1/gather/cluster*/pods_submariner-operator_submariner-gateway-*.yaml` - Gateway pod labels (for verification)
+4. `cluster2/gather/cluster*/pods_submariner-operator_submariner-gateway-*.yaml` - Gateway pod labels (for verification)
 
-**Check for:**
-- Gateway CR `status.gateways[].haStatus` (expected: 1 active, N passive)
-- Pod label `gateway.submariner.io/status` (must match CR haStatus)
-- **BUG PATTERN:** Multiple pods labeled "active" → load balancer splits traffic → random failures
+**CRITICAL Checks (in order of priority):**
+1. **Gateway CR `status.gateways[].haStatus`** - Only ONE should be "active", rest "passive"
+   - This is the authoritative source
+   - Multiple active Gateway resources = CRITICAL issue
+2. **Endpoint Consistency** - Both clusters should see same remote endpoints
+   - Check `status.gateways[].connections[].endpoint.cluster_id`
+   - Should be consistent across both clusters
+3. **Pod labels** - Should match CR haStatus (secondary check)
+   - Pod label `gateway.submariner.io/status` should align with CR
+   - Mismatch = pod label sync issue, may need investigation but not necessarily critical
 
 #### F. For Connectivity Issues:
 1. `verify/connectivity.txt` - Default packet size results
@@ -261,6 +281,30 @@ Note: The verify files contain the actual command executed at the top. Check if:
 1. `cluster1/routeagents.yaml` - RouteAgent status
 2. `cluster2/routeagents.yaml` - RouteAgent status
 3. `cluster1/gather/cluster*/submariner-routeagent-*.log` - RouteAgent logs
+
+#### G2. For API Server / IP Rule / OVN Issues (NEW - Check for connectivity failures):
+1. `cluster1/gather/cluster*/submariner-gateway-*-submariner-gateway.log` - Check for API server rate limiter errors
+2. `cluster2/gather/cluster*/submariner-gateway-*-submariner-gateway.log` - Check for API server rate limiter errors
+3. `cluster1/gather/cluster*/<nodename>_ip-rules.log` - Check for fwmark 0x3f0 IP rule
+4. `cluster2/gather/cluster*/<nodename>_ip-rules.log` - Check for fwmark 0x3f0 IP rule (compare with cluster1)
+5. `cluster1/gather/cluster*/<nodename>_ovn_lr_ovn_cluster_router_routes.log` - OVN Logical_Router_Static_Route (OVN-K only)
+6. `cluster2/gather/cluster*/<nodename>_ovn_lr_ovn_cluster_router_routes.log` - OVN Logical_Router_Static_Route (OVN-K only)
+7. `cluster1/gather/cluster*/<nodename>_ovn_lr_ovn_cluster_router_policies.log` - OVN Logical_Router_Policy (check for pkt_mark=1008)
+8. `cluster2/gather/cluster*/<nodename>_ovn_lr_ovn_cluster_router_policies.log` - OVN Logical_Router_Policy
+9. `cluster1/gather/cluster*/<gateway-node>_ip-routes.log` - Main routing table (verify NO remote cluster routes)
+10. `cluster2/gather/cluster*/<gateway-node>_ip-routes.log` - Main routing table
+
+**When to check these:**
+- Any tunnel connectivity failure with "Failed to successfully ping" errors
+- Gateway pod showing "write ip 0.0.0.0" in logs
+- OVN-Kubernetes CNI environments
+- Non-gateway nodes succeed but gateway node fails
+
+**Key patterns to look for:**
+- API server rate limiter errors (could indicate instability)
+- IP rule asymmetry between clusters (fwmark 0x3f0 on one cluster, not the other)
+- OVN packet marking (pkt_mark=1008) + fwmark IP rule may cause routing bypass
+- Main table typically should NOT have remote cluster routes (Submariner usually uses table 150)
 
 #### H. For Service Discovery Issues:
 1. `verify/service-discovery.txt` - Service discovery verification
@@ -612,6 +656,173 @@ cluster*/routeagents.yaml
 - If tunnel status is "connected" on gateway BUT non-gateway nodes show errors:
   → This IS a local routing issue (nodes can't route through their gateway)
 
+#### **Analysis 3a: API Server Health (NEW)**
+
+**Check for API server rate limiter errors in Gateway pod logs**
+
+File: `cluster*/gather/cluster*/<gateway-pod>-submariner-gateway.log`
+
+**What to look for:**
+```
+rate limiter Wait returned an error: rate: Wait(n=1) would exceed context deadline
+```
+
+**Analysis:**
+- Count occurrences across the entire log file
+- Example: 124 errors over 3 weeks could indicate API server instability
+- **Possible Impact:** May contribute to resource sync issues, OVN controller getting stuck, or routes not syncing properly
+- **Note:** Unlikely to be the direct root cause of "write ip 0.0.0.0" errors, but could contribute to overall system instability
+
+**Recommendation if found:**
+```
+Consider checking API server health:
+- oc adm top nodes (check control plane CPU/memory)
+- Review API server logs for throttling/performance issues
+- Verify etcd health is normal
+- Check control plane resource utilization
+```
+
+#### **Analysis 3b: IP Rule Consistency Between Clusters (NEW)**
+
+**CRITICAL:** Check for IP rule differences, especially `fwmark 0x3f0`
+
+File: `cluster*/gather/cluster*/<nodename>_ip-rules.log`
+
+**What to check:**
+```bash
+# Look for this rule in ip-rules.log files:
+5999: from all fwmark 0x3f0 lookup main
+```
+
+**Analysis pattern:**
+
+**Pattern 1: Cluster asymmetry (LIKELY ISSUE)**
+```
+cluster1: All nodes have "5999: from all fwmark 0x3f0 lookup main"
+cluster2: NO nodes have this rule
+
+→ This appears to be a likely root cause of connectivity failure
+```
+
+**Why this might break Gateway pod:**
+1. OVN appears to mark Gateway pod traffic with `pkt_mark=1008` (0x3f0 in hex)
+2. IP rule 5999 could intercept marked packets → forcing main table lookup
+3. Main table typically has NO routes to remote cluster CIDRs
+4. Kernel may be unable to determine source IP → could default to 0.0.0.0
+5. sendmsg() might fail with "operation not permitted"
+
+**Why non-GW nodes might succeed despite same rule:**
+- Non-GW RouteAgent traffic appears to stay in OVN overlay routing
+- Seems to not match OVN marking criteria → likely not marked with fwmark 0x3f0
+- IP rule 5999 may not trigger → table 150 routes could work normally
+
+**Pattern 2: Both clusters have it (OK)**
+```
+cluster1: Has fwmark 0x3f0 rule
+cluster2: Has fwmark 0x3f0 rule
+
+→ Consistent configuration (issue is elsewhere)
+```
+
+**Pattern 3: Neither cluster has it (OK)**
+```
+cluster1: No fwmark 0x3f0 rule
+cluster2: No fwmark 0x3f0 rule
+
+→ Consistent configuration (issue is elsewhere)
+```
+
+**Verification steps:**
+1. Check ALL nodes in both clusters (rule should be present on all or none)
+2. Look for OVN packet marking in `<nodename>_ovn_lr_ovn_cluster_router_policies.log`:
+   ```
+   pkt_mark=1008
+   ```
+3. Verify main routing table has NO routes to remote clusters:
+   ```
+   grep -E "172.32.0.0|172.34.0.0" <nodename>_ip-routes.log
+   ```
+
+**Possible root cause:**
+- This rule appears to be added by OVN-Kubernetes (possibly version-specific behavior)
+- Could be related to AdminNetworkPolicy or NetworkPolicy features
+- Consider checking OVN-K version differences between clusters
+
+#### **Analysis 3c: OVN Routing Configuration (OVN-Kubernetes only) (NEW)**
+
+**Only applicable if CNI = OVNKubernetes**
+
+**Step 1: Check OVN Logical_Router_Static_Route**
+
+File: `cluster*/gather/cluster*/<nodename>_ovn_lr_ovn_cluster_router_routes.log`
+
+**What to look for:**
+```
+IPv4 Routes
+Route Table <main>:
+            172.32.0.0/16                172.28.4.2 dst-ip
+            172.34.0.0/16                172.28.4.2 dst-ip
+```
+
+**Expected:**
+- Routes to remote cluster CIDRs should exist
+- Nexthop should be local health check IP (e.g., 172.28.4.2 on ovn-k8s-mp0)
+- Get remote CIDRs from Gateway CR `status.gateways[].connections[].endpoint.subnets[]`
+
+**Step 2: Check OVN Logical_Router_Policy**
+
+File: `cluster*/gather/cluster*/<nodename>_ovn_lr_ovn_cluster_router_policies.log`
+
+**What to look for:**
+```
+Routing Policies
+     20000                           ip4.dst == 172.32.0.0/16         reroute
+     20000                           ip4.dst == 172.34.0.0/16         reroute
+       102 ... && ip4.dst == ...     allow               pkt_mark=1008
+```
+
+**Expected:**
+- Priority 20000 policies for remote cluster CIDRs (reroute action)
+- Priority 102 policies may mark certain traffic with pkt_mark=1008
+
+**IMPORTANT:** If pkt_mark=1008 is found AND fwmark 0x3f0 IP rule exists:
+→ This combination appears to be the likely cause of Gateway pod ping failure!
+
+**Step 3: Verify main routing table does NOT have remote cluster routes**
+
+File: `cluster*/gather/cluster*/<gateway-node>_ip-routes.log`
+
+**What to check:**
+```bash
+# Should NOT find remote cluster CIDRs in main table:
+grep "172.32.0.0\|172.34.0.0" <gateway-node>_ip-routes.log
+```
+
+**Expected:**
+- Main table should NOT have routes to remote clusters
+- Submariner uses table 150 for remote cluster routing
+- If main table HAS these routes → unusual configuration
+
+**Step 4: Check table 150**
+
+File: `cluster*/gather/cluster*/<gateway-node>_ip-routes-table150.log`
+
+**Expected for OVN local gateway mode:**
+```
+default via 172.28.4.1 dev ovn-k8s-mp0
+```
+
+**NOT expected (but would work):**
+```
+172.32.0.0/16 via 172.28.4.2 dev ovn-k8s-mp0
+172.34.0.0/16 via 172.28.4.2 dev ovn-k8s-mp0
+```
+
+**Analysis:**
+- OVN local gateway mode uses OVN Logical_Router_Static_Route, NOT Linux table 150 routes
+- Both gateway nodes (working and broken) have identical table 150: just default route
+- The actual routing happens at OVN level, not Linux routing table level
+
 #### **Analysis 4: Pod Health**
 
 **Read pod status from:**
@@ -665,23 +876,28 @@ spec:
   nodeName: kube-xxxxx-node1
 ```
 
-**Detection Pattern - CRITICAL BUG:**
+**Detection Pattern - Pod Label Sync Issue:**
 
 If you find **multiple pods labeled "active"** in the same cluster:
 
 ```
 Expected: 1 pod with label "active", N pods with label "passive"
-Found:    2+ pods with label "active"  ← BUG!
+Found:    2+ pods with label "active"  ← Potential issue!
 ```
 
-**This is a CRITICAL HA label synchronization bug:**
+**IMPORTANT - Check Priority:**
+1. **FIRST:** Verify Gateway CR `status.gateways[].haStatus` - only ONE should be "active"
+   - If multiple Gateway resources show haStatus: active → **CRITICAL issue**
+   - If Gateway CR shows 1 active correctly → pod label sync issue (less critical)
 
-1. **Root Cause:**
-   - Race condition in Submariner gateway HA election logic
-   - Pod labels out of sync with Gateway CR HA state
-   - Typically happens during gateway failovers or pod restarts
+**This may indicate an HA label synchronization issue:**
 
-2. **Impact on Load Balancer:**
+1. **Possible Root Cause:**
+   - Pod labels may be out of sync with Gateway CR HA state
+   - Could indicate a race condition in gateway HA election logic
+   - Might occur during gateway failovers or pod restarts
+
+2. **Possible Impact on Load Balancer:**
    ```yaml
    # Load Balancer Service selector
    spec:
@@ -689,26 +905,27 @@ Found:    2+ pods with label "active"  ← BUG!
        app: submariner-gateway
        gateway.submariner.io/status: active  # Matches ALL pods labeled "active"
    ```
-   - If 2 pods labeled "active" → LB routes to 2 nodes
-   - Traffic split 50/50 between nodes
-   - Only 1 pod has actual tunnel connection
-   - Result: ~50% packet loss, random tunnel failures
+   - If LoadBalancer service uses selector `gateway.submariner.io/status: active`
+   - AND 2 pods are labeled "active" → LB might route to 2 nodes
+   - Traffic could be split between nodes
+   - Only 1 pod typically has actual tunnel connection
+   - Could result in packet loss or random tunnel failures
 
-3. **Why This Causes Random Failures:**
-   - UDP packets distributed by load balancer
-   - Some packets hit correct node (active with tunnel) → success
-   - Some packets hit wrong node (labeled active, but passive) → dropped
-   - Explains intermittent connectivity, breaks ODF-RDR
+3. **Why This Might Cause Issues:**
+   - If load balancer distributes packets to both pods
+   - Packets to correct node (actually active) → likely succeed
+   - Packets to wrong node (labeled active, but should be passive) → might be dropped
+   - Could explain intermittent connectivity issues
 
 **Recommended Analysis Output:**
 
-If multiple active pods detected:
+If multiple active pod labels detected:
 
 ```
-ROOT CAUSE: Gateway HA label synchronization bug (race condition)
-  - Gateway CR shows: 1 active, 1 passive (correct)
-  - Pod labels show: 2 active, 0 passive (WRONG!)
-  - Load balancer selector matches both pods
+Pod Label Issue Detected:
+  - Gateway CR shows: 1 active, 1 passive (authoritative source - correct)
+  - Pod labels show: 2 active, 0 passive (may be out of sync)
+  - This could affect load balancer traffic distribution if LB uses pod label selector
   - Traffic split causes ~50% packet loss
 
 IMMEDIATE FIX:
