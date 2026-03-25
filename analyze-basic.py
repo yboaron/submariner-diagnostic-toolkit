@@ -126,6 +126,8 @@ class SubmarinerAnalyzer:
         subctl_version = None
         cluster1_version = None
         cluster2_version = None
+        cluster1_version_line = None
+        cluster2_version_line = None
         version_mismatch_detected = False
         different_cluster_versions = False
 
@@ -135,10 +137,12 @@ class SubmarinerAnalyzer:
                 if match:
                     subctl_version = match.group(1)
             elif 'Cluster1 Submariner version:' in line:
+                cluster1_version_line = line
                 match = re.search(r'release-([0-9]+\.[0-9]+)', line)
                 if match:
                     cluster1_version = match.group(1)
             elif 'Cluster2 Submariner version:' in line:
+                cluster2_version_line = line
                 match = re.search(r'release-([0-9]+\.[0-9]+)', line)
                 if match:
                     cluster2_version = match.group(1)
@@ -147,8 +151,43 @@ class SubmarinerAnalyzer:
             elif 'Different Submariner versions between clusters' in line:
                 different_cluster_versions = True
 
+        # Check if Submariner is not deployed (version line exists but no actual version)
+        cluster1_not_deployed = cluster1_version_line and not cluster1_version
+        cluster2_not_deployed = cluster2_version_line and not cluster2_version
+        submariner_not_deployed = cluster1_not_deployed or cluster2_not_deployed
+
         # Display version information and warnings
-        if subctl_version or cluster1_version or cluster2_version:
+        if submariner_not_deployed:
+            # Submariner not deployed - show critical error
+            print(f"\n{Colors.BOLD}=== Submariner Deployment Status ==={Colors.ENDC}")
+
+            if cluster1_not_deployed:
+                print(f"  {Colors.FAIL}✗{Colors.ENDC} Cluster1: Submariner NOT deployed")
+            else:
+                print(f"  {Colors.OKGREEN}✓{Colors.ENDC} Cluster1: Submariner deployed (release-{cluster1_version})")
+
+            if cluster2_not_deployed:
+                print(f"  {Colors.FAIL}✗{Colors.ENDC} Cluster2: Submariner NOT deployed")
+            else:
+                print(f"  {Colors.OKGREEN}✓{Colors.ENDC} Cluster2: Submariner deployed (release-{cluster2_version})")
+
+            print(f"\n  {Colors.FAIL}{'='*60}{Colors.ENDC}")
+            print(f"  {Colors.FAIL}CRITICAL: Submariner not deployed on one or both clusters{Colors.ENDC}")
+            print(f"  {Colors.FAIL}{'='*60}{Colors.ENDC}")
+            print(f"  {Colors.WARNING}This diagnostic analysis is NOT valid because Submariner{Colors.ENDC}")
+            print(f"  {Colors.WARNING}components are not running on the cluster(s).{Colors.ENDC}")
+            print(f"")
+            print(f"  {Colors.BOLD}Action required:{Colors.ENDC}")
+            print(f"    Deploy Submariner on both clusters first, then re-collect diagnostics.")
+            print(f"")
+            print(f"  {Colors.BOLD}Deployment guide:{Colors.ENDC}")
+            print(f"    https://submariner.io/getting-started/")
+            print(f"  {Colors.FAIL}{'='*60}{Colors.ENDC}")
+
+            self.faulty_states.append("Submariner not deployed on one or both clusters")
+            self.recommendations.append("Deploy Submariner on all clusters before collecting diagnostics")
+
+        elif subctl_version or cluster1_version or cluster2_version:
             print(f"\n{Colors.BOLD}=== Version Compatibility ==={Colors.ENDC}")
             if subctl_version:
                 print(f"  subctl version: v{subctl_version}")
@@ -203,12 +242,71 @@ class SubmarinerAnalyzer:
                     if subctl_version and subctl_version == cluster1_version:
                         print(f"  {Colors.OKGREEN}✓ All versions compatible (v{subctl_version}){Colors.ENDC}")
 
+    def check_context_name_handling(self):
+        """Check if context names were overlapping and renamed"""
+        manifest_content = self.read_file("manifest.txt")
+        if not manifest_content:
+            return
+
+        # Look for context name handling section
+        if "Context Name Handling:" in manifest_content:
+            print(f"\n{Colors.BOLD}=== Context Name Handling (Informational) ==={Colors.ENDC}")
+
+            # Extract relevant information
+            original_cluster1_context = None
+            original_cluster2_context = None
+            renamed_cluster1_context = None
+
+            for line in manifest_content.split('\n'):
+                if 'Original cluster1 context:' in line:
+                    original_cluster1_context = line.split(':', 1)[1].strip()
+                elif 'Original cluster2 context:' in line:
+                    original_cluster2_context = line.split(':', 1)[1].strip()
+                elif 'Renamed cluster1 context:' in line:
+                    renamed_cluster1_context = line.split(':', 1)[1].strip()
+
+            if original_cluster1_context and original_cluster2_context and original_cluster1_context == original_cluster2_context:
+                print(f"  {Colors.OKCYAN}ℹ{Colors.ENDC} {Colors.BOLD}HEADS-UP:{Colors.ENDC} Identical context names detected in both kubeconfig files")
+                print(f"    Both clusters use context name: '{original_cluster1_context}'")
+                print(f"")
+                print(f"  {Colors.BOLD}What this means:{Colors.ENDC}")
+                print(f"    • This is NOT a fault with your Submariner deployment")
+                print(f"    • However, subctl commands that require 2 contexts might fail, such as:")
+                print(f"      {Colors.OKCYAN}subctl verify --context <cluster1> --tocontext <cluster2>{Colors.ENDC}")
+                print(f"      {Colors.OKCYAN}subctl diagnose firewall inter-cluster --context <c1> --remotecontext <c2>{Colors.ENDC}")
+                print(f"")
+                print(f"  {Colors.BOLD}How the collection handled it:{Colors.ENDC}")
+                print(f"    • Auto-renamed cluster1 context to: '{renamed_cluster1_context}'")
+                print(f"    • Used renamed context for all subctl commands during collection")
+                print(f"    • Original kubeconfig files remain unchanged")
+                print(f"")
+                print(f"  {Colors.BOLD}If you need to run manual subctl commands:{Colors.ENDC}")
+                print(f"    You must rename the context in one of your kubeconfig files:")
+                print(f"")
+                print(f"    {Colors.OKCYAN}# Backup your kubeconfig{Colors.ENDC}")
+                print(f"    cp /path/to/kubeconfig /path/to/kubeconfig.backup")
+                print(f"")
+                print(f"    {Colors.OKCYAN}# Rename context{Colors.ENDC}")
+                print(f"    kubectl config rename-context {original_cluster1_context} cluster1 --kubeconfig=/path/to/kubeconfig")
+                print(f"")
+                print(f"    {Colors.OKCYAN}# Verify{Colors.ENDC}")
+                print(f"    kubectl config get-contexts --kubeconfig=/path/to/kubeconfig")
+
+                # Add to recommendations for the final summary
+                self.recommendations.append(
+                    f"To run manual subctl commands with 2 contexts, rename '{original_cluster1_context}' "
+                    f"to unique names in your kubeconfig files (e.g., 'cluster1' and 'cluster2')"
+                )
+
     def check_faulty_states(self):
         """Check for faulty states before starting deep analysis"""
         print(f"\n{Colors.BOLD}=== Checking for Faulty States ==={Colors.ENDC}")
 
         # Check version compatibility first
         self.check_version_compatibility()
+
+        # Check for context name handling
+        self.check_context_name_handling()
 
         # Check tunnel status
         cluster1_show = self.read_file("cluster1/subctl-show-all.txt")
@@ -1715,10 +1813,17 @@ class SubmarinerAnalyzer:
         print(f"{Colors.BOLD}{'='*60}{Colors.ENDC}")
 
         # Check for version issues and display prominent warning at top
+        has_not_deployed = any("not deployed" in fault.lower() for fault in self.faulty_states)
         has_version_mismatch = any("version mismatch" in fault.lower() for fault in self.faulty_states)
         has_different_versions = any("different submariner versions" in fault.lower() for fault in self.faulty_states)
 
-        if has_version_mismatch:
+        if has_not_deployed:
+            print(f"\n{Colors.FAIL}╔{'═'*58}╗{Colors.ENDC}")
+            print(f"{Colors.FAIL}║  ⚠ CRITICAL: SUBMARINER NOT DEPLOYED                    ║{Colors.ENDC}")
+            print(f"{Colors.FAIL}║  Analysis is NOT VALID - no Submariner components found ║{Colors.ENDC}")
+            print(f"{Colors.FAIL}╚{'═'*58}╝{Colors.ENDC}")
+            print(f"{Colors.WARNING}Deploy Submariner on both clusters before collecting diagnostics.{Colors.ENDC}\n")
+        elif has_version_mismatch:
             print(f"\n{Colors.FAIL}╔{'═'*58}╗{Colors.ENDC}")
             print(f"{Colors.FAIL}║  ⚠ WARNING: VERSION MISMATCH DETECTED                   ║{Colors.ENDC}")
             print(f"{Colors.FAIL}║  Analysis results below may be INCORRECT or MISLEADING  ║{Colors.ENDC}")

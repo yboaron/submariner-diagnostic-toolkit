@@ -110,6 +110,59 @@ diagnostics-dir/
 - Extract timestamp
 - Extract complaint (if not provided by user)
 - Note which clusters were collected
+- Check for context name handling (if overlapping contexts were auto-fixed)
+
+**Check for Submariner Deployment:**
+
+The collection script validates that Submariner is deployed on both clusters before collecting diagnostics. If Submariner is not found:
+
+```
+ERROR: Submariner not deployed
+========================================
+
+This tool collects diagnostics from existing Submariner deployments.
+Submariner must be deployed on BOTH clusters before running diagnostics.
+```
+
+**Why this check exists:**
+- Without Submariner deployed, there's nothing to diagnose
+- Prevents wasting time collecting meaningless data
+- Avoids confusing "version mismatch" errors when the real issue is "not deployed"
+
+**Detection method:**
+- Checks for `submariner-operator` deployment in `submariner-operator` namespace
+- If not found on either cluster, collection stops immediately
+
+**Analysis implications:**
+- If you see "Submariner not deployed" in the Python analyzer output, it means:
+  - The diagnostic data was collected from clusters without Submariner
+  - Analysis results are not valid (no Submariner components to analyze)
+  - User must deploy Submariner first, then re-collect diagnostics
+
+**Check for Context Name Conflicts:**
+
+Read manifest.txt for "Context Name Handling:" section. If present, this indicates that both clusters had the same context name in their kubeconfig files.
+
+```
+Context Name Handling:
+  ⚠ Overlapping context names detected and auto-fixed
+  Original cluster1 context: default-context
+  Original cluster2 context: default-context
+  Renamed cluster1 context: default-context-cluster1
+  Action: Created temporary kubeconfig copy with renamed context
+  Note: This was required because subctl verify needs unique context names
+```
+
+**Why this matters:**
+- `subctl verify` requires unique context names to distinguish between clusters
+- If both kubeconfig files use the same context name (e.g., "default-context"), the verify command will fail
+- The collection script automatically detects this and creates a temporary copy of one kubeconfig with a renamed context
+- This is purely a collection-time fix; it doesn't affect the actual cluster configuration
+
+**Analysis implications:**
+- This is informational, not a fault
+- It means the diagnostic collection handled the prerequisite automatically
+- Recommend users rename contexts permanently for clarity in future collections
 
 **Detect Deployment Type (CRITICAL):**
 

@@ -5,6 +5,16 @@
 # Don't use 'set -e' to avoid closing the shell on errors
 # Instead, we'll handle errors explicitly
 
+# Cleanup function for temporary files
+cleanup_temp_files() {
+    if [ "$CONTEXT_RENAMED" = "true" ] && [ -n "$KUBECONFIG1_MODIFIED" ] && [ -f "$KUBECONFIG1_MODIFIED" ]; then
+        rm -f "$KUBECONFIG1_MODIFIED"
+    fi
+}
+
+# Register cleanup on exit (handles both success and failure)
+trap cleanup_temp_files EXIT INT TERM
+
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
 OUTPUT_DIR="submariner-diagnostics-${TIMESTAMP}"
 CLUSTER1_CONTEXT="$1"
@@ -469,15 +479,58 @@ if ! kubectl cluster-info --kubeconfig "$KUBECONFIG2" --context "$CLUSTER2_CONTE
     return 1 2>/dev/null || exit 1
 fi
 
-# Validate contexts have different names
+# Check for overlapping context names
+CONTEXT_RENAMED=false
+ORIGINAL_CLUSTER1_CONTEXT="$CLUSTER1_CONTEXT"
+KUBECONFIG1_MODIFIED=""
+
 if [ "$CLUSTER1_CONTEXT" = "$CLUSTER2_CONTEXT" ]; then
-    echo "ERROR: Context names must be different for cluster1 and cluster2"
-    echo "  cluster1 context: $CLUSTER1_CONTEXT"
-    echo "  cluster2 context: $CLUSTER2_CONTEXT"
+    echo "WARNING: Both clusters use the same context name: '$CLUSTER1_CONTEXT'"
+    echo "  This will cause 'subctl verify' to fail (it requires unique context names)"
     echo ""
-    echo "Using the same context for both clusters will cause 'subctl verify' to fail."
-    echo "Please provide unique context names for each cluster."
-    return 1 2>/dev/null || exit 1
+    echo "Auto-fixing: Creating a copy of cluster1 kubeconfig with renamed context..."
+    echo ""
+
+    # Create a temporary modified kubeconfig for cluster1
+    KUBECONFIG1_MODIFIED="${KUBECONFIG1}.submariner-renamed-context"
+    cp "$KUBECONFIG1" "$KUBECONFIG1_MODIFIED"
+
+    # Generate new unique context name
+    NEW_CLUSTER1_CONTEXT="${CLUSTER1_CONTEXT}-cluster1"
+
+    # Rename context in the copy using kubectl
+    # This renames: context name, cluster reference, and user reference
+    KUBECONFIG="$KUBECONFIG1_MODIFIED" kubectl config rename-context "$CLUSTER1_CONTEXT" "$NEW_CLUSTER1_CONTEXT" >/dev/null 2>&1
+
+    if [ $? -eq 0 ]; then
+        echo "  ✓ Created modified kubeconfig: $KUBECONFIG1_MODIFIED"
+        echo "  ✓ Renamed context: '$CLUSTER1_CONTEXT' → '$NEW_CLUSTER1_CONTEXT'"
+        echo "  ✓ Original kubeconfig preserved: $KUBECONFIG1"
+        echo ""
+
+        # Update cluster1 context to use the renamed one
+        CLUSTER1_CONTEXT="$NEW_CLUSTER1_CONTEXT"
+        KUBECONFIG1="$KUBECONFIG1_MODIFIED"
+        CONTEXT_RENAMED=true
+
+        echo "Proceeding with renamed context for cluster1..."
+        echo "  cluster1 context: $CLUSTER1_CONTEXT (renamed)"
+        echo "  cluster2 context: $CLUSTER2_CONTEXT (original)"
+        echo ""
+    else
+        echo "ERROR: Failed to rename context in kubeconfig copy"
+        echo "Please manually rename the context in one of your kubeconfig files."
+        echo ""
+        echo "Example manual fix:"
+        echo "  # Backup your kubeconfig"
+        echo "  cp $KUBECONFIG1 ${KUBECONFIG1}.backup"
+        echo ""
+        echo "  # Rename context"
+        echo "  kubectl config rename-context $CLUSTER1_CONTEXT cluster1 --kubeconfig=$KUBECONFIG1"
+        echo ""
+        echo "  # Then re-run this script with the renamed context name"
+        return 1 2>/dev/null || exit 1
+    fi
 fi
 
 # Check for required tools
@@ -495,6 +548,59 @@ if ! command -v kubectl &>/dev/null; then
 fi
 
 echo "✓ All validations passed"
+echo ""
+
+# Check if Submariner is deployed on both clusters
+echo "Checking if Submariner is deployed on both clusters..."
+
+# Check cluster1
+if kubectl get deployment submariner-operator -n submariner-operator --kubeconfig="${KUBECONFIG1}" --context="${CLUSTER1_CONTEXT}" >/dev/null 2>&1; then
+    SUBMARINER_DEPLOYED_C1="1"
+else
+    SUBMARINER_DEPLOYED_C1="0"
+fi
+
+# Check cluster2
+if kubectl get deployment submariner-operator -n submariner-operator --kubeconfig="${KUBECONFIG2}" --context="${CLUSTER2_CONTEXT}" >/dev/null 2>&1; then
+    SUBMARINER_DEPLOYED_C2="1"
+else
+    SUBMARINER_DEPLOYED_C2="0"
+fi
+
+SUBMARINER_NOT_DEPLOYED=false
+
+if [ "$SUBMARINER_DEPLOYED_C1" = "0" ]; then
+    echo "  ✗ Cluster1: Submariner operator not found in 'submariner-operator' namespace"
+    SUBMARINER_NOT_DEPLOYED=true
+else
+    echo "  ✓ Cluster1: Submariner operator found"
+fi
+
+if [ "$SUBMARINER_DEPLOYED_C2" = "0" ]; then
+    echo "  ✗ Cluster2: Submariner operator not found in 'submariner-operator' namespace"
+    SUBMARINER_NOT_DEPLOYED=true
+else
+    echo "  ✓ Cluster2: Submariner operator found"
+fi
+
+if [ "$SUBMARINER_NOT_DEPLOYED" = "true" ]; then
+    echo ""
+    echo "========================================"
+    echo "ERROR: Submariner not deployed"
+    echo "========================================"
+    echo ""
+    echo "This tool collects diagnostics from existing Submariner deployments."
+    echo "Submariner must be deployed on BOTH clusters before running diagnostics."
+    echo ""
+    echo "To deploy Submariner, see:"
+    echo "  https://submariner.io/getting-started/"
+    echo ""
+    echo "If Submariner is deployed in a different namespace, please check:"
+    echo "  kubectl get deployments -A | grep submariner"
+    echo ""
+    return 1 2>/dev/null || exit 1
+fi
+
 echo ""
 
 # Check subctl and Submariner version compatibility
@@ -591,6 +697,18 @@ echo ""
 echo "Timestamp: ${TIMESTAMP}" > "${OUTPUT_DIR}/manifest.txt"
 echo "Complaint: ${COMPLAINT}" >> "${OUTPUT_DIR}/manifest.txt"
 echo "" >> "${OUTPUT_DIR}/manifest.txt"
+
+# Document context renaming if it occurred
+if [ "$CONTEXT_RENAMED" = "true" ]; then
+    echo "Context Name Handling:" >> "${OUTPUT_DIR}/manifest.txt"
+    echo "  ⚠ Overlapping context names detected and auto-fixed" >> "${OUTPUT_DIR}/manifest.txt"
+    echo "  Original cluster1 context: ${ORIGINAL_CLUSTER1_CONTEXT}" >> "${OUTPUT_DIR}/manifest.txt"
+    echo "  Original cluster2 context: ${CLUSTER2_CONTEXT}" >> "${OUTPUT_DIR}/manifest.txt"
+    echo "  Renamed cluster1 context: ${CLUSTER1_CONTEXT}" >> "${OUTPUT_DIR}/manifest.txt"
+    echo "  Action: Created temporary kubeconfig copy with renamed context" >> "${OUTPUT_DIR}/manifest.txt"
+    echo "  Note: This was required because subctl verify needs unique context names" >> "${OUTPUT_DIR}/manifest.txt"
+    echo "" >> "${OUTPUT_DIR}/manifest.txt"
+fi
 
 # Add version information to manifest
 echo "Version Information:" >> "${OUTPUT_DIR}/manifest.txt"
@@ -1444,3 +1562,11 @@ echo "2. They can analyze it offline without needing cluster access"
 echo "3. For AI-assisted analysis with Claude Code, run:"
 echo "   /submariner:analyze-offline ${OUTPUT_DIR}.tar.gz"
 echo ""
+
+# Cleanup temporary kubeconfig if it was created
+if [ "$CONTEXT_RENAMED" = "true" ] && [ -n "$KUBECONFIG1_MODIFIED" ] && [ -f "$KUBECONFIG1_MODIFIED" ]; then
+    echo "Cleaning up temporary kubeconfig file..."
+    rm -f "$KUBECONFIG1_MODIFIED"
+    echo "  ✓ Removed: $KUBECONFIG1_MODIFIED"
+    echo ""
+fi
