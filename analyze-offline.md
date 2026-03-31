@@ -1302,7 +1302,7 @@ is encapsulated inside the IPsec tunnel, so infrastructure only sees ESP/UDP pac
 1. **Verify Submariner Prerequisites:**
    Ensure all infrastructure and datapath prerequisites are properly configured:
 
-   📖 [Submariner Prerequisites Documentation](https://docs.redhat.com/en/documentation/red_hat_advanced_cluster_management_for_kubernetes/2.15/html/networking/networking#submariner-prereqs)
+   📖 [Submariner Prerequisites Documentation](https://submariner.io/getting-started/architecture/requirements/)
 
 2. **Confirm Network Path Requirements:**
    - Verify required protocols are allowed between gateway nodes

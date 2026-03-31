@@ -511,6 +511,12 @@ class SubmarinerAnalyzer:
                     print(f"  {Colors.WARNING}⚠{Colors.ENDC} Service discovery verification: INCONCLUSIVE")
 
         # Check for OVNK SNAT issue pattern
+        # Diagnostic workflow:
+        # 1. Regular connectivity fails
+        # 2. Small packet size also fails (ruling out MTU issue)
+        # 3. CNI is OVN-Kubernetes
+        # 4. Tests with --skip-src-ip-check pass
+        # This pattern indicates the known OVNK SNAT bug affecting Submariner
         skip_src_ip_check = self.read_file("verify/connectivity-skip-src-ip-check.txt")
         if skip_src_ip_check:
             skip_src_ip_passed = False
@@ -524,23 +530,51 @@ class SubmarinerAnalyzer:
                 skip_src_ip_failed = True
                 print(f"  {Colors.FAIL}✗{Colors.ENDC} Connectivity with --skip-src-ip-check: FAILED")
 
-            # Detect OVNK SNAT issue: regular connectivity failed but skip-src-ip-check passed
+            # Detect OVNK SNAT issue:
+            # - Regular connectivity failed
+            # - Small packet test also failed (not MTU issue)
+            # - CNI is OVN-Kubernetes
+            # - skip-src-ip-check passed
             if connectivity_failed and skip_src_ip_passed:
                 # Detect CNI to confirm OVNK
                 cni_cluster1 = self.detect_cni("cluster1")
                 cni_cluster2 = self.detect_cni("cluster2")
 
-                print(f"\n  {Colors.FAIL}✗ OVNK SNAT ISSUE DETECTED:{Colors.ENDC}")
-                print(f"    Regular connectivity tests: FAILED")
-                print(f"    Connectivity with --skip-src-ip-check: PASSED")
-                print(f"    CNI detected: Cluster1={cni_cluster1}, Cluster2={cni_cluster2}")
-                print(f"    → This indicates OVNK SNAT is breaking Submariner connectivity")
-                self.faulty_states.append("OVNK SNAT issue detected (regular connectivity fails, --skip-src-ip-check passes)")
-                self.issues.append(f"OVNK CNI SNAT prevents Submariner cross-cluster connectivity (CNI: {cni_cluster1}/{cni_cluster2})")
-                self.recommendations.insert(0, "OVNK SNAT Issue: Apply the OVNK fix for Submariner compatibility")
-                self.recommendations.insert(1, "Check if your OVNK version has the Submariner SNAT fix available")
-                self.recommendations.insert(2, "See: https://github.com/ovn-org/ovn-kubernetes/pull/XXXXX (OVNK fix for Submariner)")
-                self.recommendations.insert(3, "Workaround: Use --skip-src-ip-check flag for testing (not recommended for production)")
+                # Check if either cluster uses OVNK
+                is_ovnk = (cni_cluster1 == "OVNKubernetes" or cni_cluster2 == "OVNKubernetes")
+
+                # Check if small packet test also failed (not MTU issue)
+                # If small packet passed, it's an MTU issue (already handled above)
+                # If small packet also failed, and OVNK is in use, this could be the SNAT issue
+                is_not_mtu_issue = small_packet_failed or not small_packet_passed
+
+                if is_ovnk and is_not_mtu_issue:
+                    print(f"\n  {Colors.FAIL}✗ KNOWN OVNK SNAT ISSUE DETECTED:{Colors.ENDC}")
+                    print(f"    Regular connectivity tests: FAILED")
+                    print(f"    Small packet tests: FAILED (not MTU issue)")
+                    print(f"    Connectivity with --skip-src-ip-check: PASSED")
+                    print(f"    CNI detected: Cluster1={cni_cluster1}, Cluster2={cni_cluster2}")
+                    print(f"    → This pattern indicates a known OVNK SNAT bug affecting Submariner")
+                    self.faulty_states.append("Known OVNK SNAT issue detected (connectivity fails, --skip-src-ip-check passes)")
+                    self.issues.append(f"OVNK CNI SNAT bug prevents Submariner connectivity (CNI: {cni_cluster1}/{cni_cluster2})")
+                    self.recommendations.insert(0, "Issue could be related to this known issue:")
+                    self.recommendations.insert(1, "https://github.com/submariner-io/submariner/issues/3307#issuecomment-2653220140")
+                    self.recommendations.insert(2, "Check if your OVNK/OpenShift version includes the fix for this known issue")
+                    self.recommendations.insert(3, "For assistance, reach out to the Submariner community on Slack (#submariner-users) or file an issue at github.com/submariner-io/submariner")
+                elif not is_not_mtu_issue:
+                    # Small packet passed but regular failed - this is MTU (already handled)
+                    # Skip additional OVNK reporting
+                    pass
+                else:
+                    # OVNK not detected but skip-src-ip-check helped
+                    print(f"\n  {Colors.WARNING}⚠ Source IP verification issue detected:{Colors.ENDC}")
+                    print(f"    Regular connectivity tests: FAILED")
+                    print(f"    Connectivity with --skip-src-ip-check: PASSED")
+                    print(f"    CNI detected: Cluster1={cni_cluster1}, Cluster2={cni_cluster2}")
+                    print(f"    → Source IP verification is failing, but not using OVNK")
+                    self.faulty_states.append("Source IP verification issue (connectivity fails, --skip-src-ip-check passes)")
+                    self.issues.append("Source IP is being modified during packet transit")
+                    self.recommendations.append("Investigate NAT or source IP rewriting between clusters")
 
         # Set verify_tests_passed only if ALL tests that ran passed
         if tests_found:

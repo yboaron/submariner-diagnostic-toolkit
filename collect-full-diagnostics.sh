@@ -877,24 +877,10 @@ if [ "$RUN_FIREWALL_INTER_CLUSTER" = "true" ]; then
     echo "  NAT-T port: ${NATT_PORT_C1}" >> "${OUTPUT_DIR}/manifest.txt"
     echo "" >> "${OUTPUT_DIR}/manifest.txt"
 
-    # Use IMAGE_OVERRIDE variable if already set from verify section, otherwise detect it
+    # Use IMAGE_OVERRIDE variable if already set from verify section, otherwise use quay.io as default
     if [ -z "$IMAGE_OVERRIDE" ]; then
-        # Quick registry check (simplified version)
-        echo "Checking image registry accessibility..."
-        RH_REGISTRY_OK=true
-        kubectl run fw-registry-check --image=registry.redhat.io/rhacm2/nettest:0.21.0 --restart=Never --kubeconfig="${KUBECONFIG1}" --context="${CLUSTER1_CONTEXT}" --command -- sleep 1 >/dev/null 2>&1
-        sleep 2
-        POD_STATUS=$(kubectl get pod fw-registry-check --kubeconfig="${KUBECONFIG1}" --context="${CLUSTER1_CONTEXT}" -o jsonpath='{.status.containerStatuses[0].state}' 2>/dev/null)
-        if ! echo "$POD_STATUS" | grep -qE "running|terminated|waiting.*PodInitializing|waiting.*ContainerCreating"; then
-            RH_REGISTRY_OK=false
-        fi
-        kubectl delete pod fw-registry-check --kubeconfig="${KUBECONFIG1}" --context="${CLUSTER1_CONTEXT}" --wait=false >/dev/null 2>&1
-
-        if [ "$RH_REGISTRY_OK" = "false" ]; then
-            FIREWALL_IMAGE_OVERRIDE="--image-override submariner-nettest=quay.io/submariner/nettest:devel"
-        else
-            FIREWALL_IMAGE_OVERRIDE=""
-        fi
+        # Use quay.io as default for upstream Submariner
+        FIREWALL_IMAGE_OVERRIDE="--image-override submariner-nettest=quay.io/submariner/nettest:devel"
     else
         FIREWALL_IMAGE_OVERRIDE="$IMAGE_OVERRIDE"
     fi
@@ -950,24 +936,10 @@ fi
 
 # Setup image override if needed (for both clusters)
 if [ "$RUN_FIREWALL_INTRA_CLUSTER1" = "true" ] || [ "$RUN_FIREWALL_INTRA_CLUSTER2" = "true" ]; then
-    # Use the same image override as inter-cluster if available
+    # Use the same image override as inter-cluster if available, otherwise use quay.io as default
     if [ -z "$FIREWALL_IMAGE_OVERRIDE" ]; then
-        # Quick registry check if not done already
-        echo "Checking image registry accessibility..."
-        RH_REGISTRY_OK=true
-        kubectl run fw-intra-registry-check --image=registry.redhat.io/rhacm2/nettest:0.21.0 --restart=Never --kubeconfig="${KUBECONFIG1}" --context="${CLUSTER1_CONTEXT}" --command -- sleep 1 >/dev/null 2>&1
-        sleep 2
-        POD_STATUS=$(kubectl get pod fw-intra-registry-check --kubeconfig="${KUBECONFIG1}" --context="${CLUSTER1_CONTEXT}" -o jsonpath='{.status.containerStatuses[0].state}' 2>/dev/null)
-        if ! echo "$POD_STATUS" | grep -qE "running|terminated|waiting.*PodInitializing|waiting.*ContainerCreating"; then
-            RH_REGISTRY_OK=false
-        fi
-        kubectl delete pod fw-intra-registry-check --kubeconfig="${KUBECONFIG1}" --context="${CLUSTER1_CONTEXT}" --wait=false >/dev/null 2>&1
-
-        if [ "$RH_REGISTRY_OK" = "false" ]; then
-            FIREWALL_IMAGE_OVERRIDE="--image-override submariner-nettest=quay.io/submariner/nettest:devel"
-        else
-            FIREWALL_IMAGE_OVERRIDE=""
-        fi
+        # Use quay.io as default for upstream Submariner
+        FIREWALL_IMAGE_OVERRIDE="--image-override submariner-nettest=quay.io/submariner/nettest:devel"
     fi
 fi
 
@@ -1053,46 +1025,9 @@ fi
 # Only run verify tests if tunnel is connected on at least one cluster
 if [ "$SKIP_VERIFY" = "false" ]; then
     echo ""
-    # Detect which image registry is accessible by actually trying to create pods on BOTH clusters
-    echo "Detecting accessible image registry for nettest..."
-    IMAGE_OVERRIDE=""
-    RH_REGISTRY_OK=true
-
-    # Test default Red Hat registry on cluster1
-    echo "Testing registry.redhat.io/rhacm2/nettest:0.21.0 on cluster1..."
-    kubectl run nettest-registry-check --image=registry.redhat.io/rhacm2/nettest:0.21.0 --restart=Never --kubeconfig="${KUBECONFIG1}" --context="${CLUSTER1_NAME}" --command -- sleep 1 >/dev/null 2>&1
-    sleep 3
-    POD_STATUS=$(kubectl get pod nettest-registry-check --kubeconfig="${KUBECONFIG1}" --context="${CLUSTER1_NAME}" -o jsonpath='{.status.containerStatuses[0].state}' 2>/dev/null)
-
-    if echo "$POD_STATUS" | grep -qE "running|terminated|waiting.*PodInitializing|waiting.*ContainerCreating"; then
-        echo "  ✓ Cluster1: registry.redhat.io is accessible"
-    else
-        echo "  ✗ Cluster1: registry.redhat.io not accessible (ImagePullBackOff)"
-        RH_REGISTRY_OK=false
-    fi
-    kubectl delete pod nettest-registry-check --kubeconfig="${KUBECONFIG1}" --context="${CLUSTER1_NAME}" --wait=false >/dev/null 2>&1
-
-    # Test default Red Hat registry on cluster2
-    echo "Testing registry.redhat.io/rhacm2/nettest:0.21.0 on cluster2..."
-    kubectl run nettest-registry-check --image=registry.redhat.io/rhacm2/nettest:0.21.0 --restart=Never --kubeconfig="${KUBECONFIG2}" --context="${CLUSTER2_NAME}" --command -- sleep 1 >/dev/null 2>&1
-    sleep 3
-    POD_STATUS=$(kubectl get pod nettest-registry-check --kubeconfig="${KUBECONFIG2}" --context="${CLUSTER2_NAME}" -o jsonpath='{.status.containerStatuses[0].state}' 2>/dev/null)
-
-    if echo "$POD_STATUS" | grep -qE "running|terminated|waiting.*PodInitializing|waiting.*ContainerCreating"; then
-        echo "  ✓ Cluster2: registry.redhat.io is accessible"
-    else
-        echo "  ✗ Cluster2: registry.redhat.io not accessible (ImagePullBackOff)"
-        RH_REGISTRY_OK=false
-    fi
-    kubectl delete pod nettest-registry-check --kubeconfig="${KUBECONFIG2}" --context="${CLUSTER2_NAME}" --wait=false >/dev/null 2>&1
-
-    # If both clusters can access Red Hat registry, use default image
-    if [ "$RH_REGISTRY_OK" = "true" ]; then
-        echo "  ✓ Both clusters can access registry.redhat.io - using default image"
-    else
-        echo "  ✗ At least one cluster cannot access registry.redhat.io - using quay.io mirror"
-        IMAGE_OVERRIDE="--image-override submariner-nettest=quay.io/submariner/nettest:devel"
-    fi
+    # Use quay.io as default for upstream Submariner
+    echo "Using quay.io/submariner/nettest:devel as default image..."
+    IMAGE_OVERRIDE="--image-override submariner-nettest=quay.io/submariner/nettest:devel"
 
     # Merge kubeconfigs temporarily for subctl verify
     MERGED_KUBECONFIG="${OUTPUT_DIR}/merged-kubeconfig"
@@ -1433,11 +1368,24 @@ if [ "$SKIP_VERIFY" = "false" ]; then
         fi
     fi
 
-    # If OVNK detected AND connectivity failed, run verify with --skip-src-ip-check
-    if [ "$OVNK_DETECTED" = "true" ] && [ "$CONNECTIVITY_FAILED" = "true" ]; then
+    # Check if small packet tests also failed (to rule out MTU issues)
+    SMALL_PACKET_FAILED=false
+    if [ -f "${OUTPUT_DIR}/verify/connectivity-small-packet.txt" ]; then
+        # Check if test was actually run (not skipped)
+        if ! grep -qE "SKIPPED|MTU TEST SKIPPED|SMALL PACKET TEST SKIPPED" "${OUTPUT_DIR}/verify/connectivity-small-packet.txt" 2>/dev/null; then
+            # Test was run - check if it failed
+            if grep -qE "FAIL|Failed|timed out|stopped early" "${OUTPUT_DIR}/verify/connectivity-small-packet.txt" 2>/dev/null; then
+                SMALL_PACKET_FAILED=true
+            fi
+        fi
+    fi
+
+    # If OVNK detected AND connectivity failed AND small packet also failed (not MTU issue), run verify with --skip-src-ip-check
+    # This helps identify the known OVNK SNAT bug that affects Submariner
+    if [ "$OVNK_DETECTED" = "true" ] && [ "$CONNECTIVITY_FAILED" = "true" ] && [ "$SMALL_PACKET_FAILED" = "true" ]; then
         echo ""
-        echo "Running additional verify test with --skip-src-ip-check (OVNK SNAT workaround)..."
-        echo "  This helps identify if OVNK SNAT is causing connectivity issues"
+        echo "Running additional verify test with --skip-src-ip-check (testing for known OVNK SNAT issue)..."
+        echo "  This helps identify if the known OVNK SNAT bug is causing connectivity issues"
         echo "  Start time: $(date '+%Y-%m-%d %H:%M:%S')"
         echo ""
 
@@ -1448,9 +1396,13 @@ if [ "$SKIP_VERIFY" = "false" ]; then
         echo "========================================" >> "${OUTPUT_DIR}/verify/connectivity-skip-src-ip-check.txt"
         echo "" >> "${OUTPUT_DIR}/verify/connectivity-skip-src-ip-check.txt"
         echo "CONTEXT: This test was run because:" >> "${OUTPUT_DIR}/verify/connectivity-skip-src-ip-check.txt"
-        echo "  - Regular connectivity tests failed" >> "${OUTPUT_DIR}/verify/connectivity-skip-src-ip-check.txt"
+        echo "  - Regular connectivity tests: FAILED" >> "${OUTPUT_DIR}/verify/connectivity-skip-src-ip-check.txt"
+        echo "  - Small packet size tests: FAILED (rules out MTU issue)" >> "${OUTPUT_DIR}/verify/connectivity-skip-src-ip-check.txt"
         echo "  - OVNK CNI detected (Cluster1: ${CNI_CLUSTER1}, Cluster2: ${CNI_CLUSTER2})" >> "${OUTPUT_DIR}/verify/connectivity-skip-src-ip-check.txt"
-        echo "  - Testing if OVNK SNAT issue is the root cause" >> "${OUTPUT_DIR}/verify/connectivity-skip-src-ip-check.txt"
+        echo "  - Testing if known OVNK SNAT bug is the root cause" >> "${OUTPUT_DIR}/verify/connectivity-skip-src-ip-check.txt"
+        echo "" >> "${OUTPUT_DIR}/verify/connectivity-skip-src-ip-check.txt"
+        echo "If this test passes, it indicates the known OVNK SNAT issue documented at:" >> "${OUTPUT_DIR}/verify/connectivity-skip-src-ip-check.txt"
+        echo "https://github.com/submariner-io/submariner/issues/3307#issuecomment-2653220140" >> "${OUTPUT_DIR}/verify/connectivity-skip-src-ip-check.txt"
         echo "" >> "${OUTPUT_DIR}/verify/connectivity-skip-src-ip-check.txt"
 
         # Run verify with --skip-src-ip-check
@@ -1487,8 +1439,15 @@ if [ "$SKIP_VERIFY" = "false" ]; then
 
         wait $VERIFY_PID 2>/dev/null || echo "OVNK verify test failed or timed out" >> "${OUTPUT_DIR}/verify/connectivity-skip-src-ip-check.txt"
         echo "  End time: $(date '+%Y-%m-%d %H:%M:%S')"
-    elif [ "$OVNK_DETECTED" = "true" ] && [ "$CONNECTIVITY_FAILED" = "false" ]; then
+    elif [ "$CONNECTIVITY_FAILED" = "false" ]; then
         echo "  → Regular connectivity tests passed - no need for OVNK-specific test"
+    elif [ "$CONNECTIVITY_FAILED" = "true" ] && [ "$SMALL_PACKET_FAILED" = "false" ]; then
+        echo "  → Small packet test passed but regular failed - this is an MTU issue, not OVNK SNAT"
+        echo "     Skipping OVNK-specific test (MTU issue already detected)"
+    elif [ "$OVNK_DETECTED" = "false" ]; then
+        echo "  → OVNK CNI not detected - skipping OVNK-specific test"
+    else
+        echo "  → Skipping OVNK-specific test (conditions not met)"
     fi
 
     # Cleanup merged kubeconfig
